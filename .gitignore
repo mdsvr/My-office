@@ -1,0 +1,5 @@
+/target
+/data
+/.npm-cache
+/web/node_modules
+/web/dist
