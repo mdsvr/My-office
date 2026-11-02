@@ -1,12 +1,17 @@
-use rusqlite::{params, Connection, Params, Row};
+use rusqlite::{params, Connection, OptionalExtension, Params, Row};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+/// Days since 1970 (UTC). Used as the key for "tokens today".
+pub fn day() -> i64 {
+    now() / 86_400
 }
 
 const SCHEMA: &str = "
@@ -20,6 +25,7 @@ create table if not exists jobs(
   id integer primary key,
   repo text not null,
   issue integer not null,
+  kind text not null default 'issue',
   title text not null,
   url text not null default '',
   state text not null,
@@ -28,14 +34,22 @@ create table if not exists jobs(
   pr_url text not null default '',
   pr_state text not null default '',
   created integer not null,
-  updated integer not null,
-  unique(repo, issue));
+  updated integer not null);
+create index if not exists jobs_repo_issue on jobs(repo, issue);
+create index if not exists jobs_state on jobs(state);
 create table if not exists events(
   id integer primary key,
   t integer not null,
-  worker text not null,
+  agent text not null,
   job integer,
   msg text not null);
+create table if not exists tokens(
+  day integer not null,
+  agent text not null,
+  tok integer not null default 0,
+  usd real not null default 0,
+  primary key(day, agent));
+create table if not exists settings(k text primary key, v text not null);
 ";
 
 #[derive(Clone, Serialize)]
@@ -46,19 +60,21 @@ pub struct Repo {
     pub enabled: bool,
 }
 
-/// One GitHub issue moving through the pipeline. `state` is the stage:
-/// queued → preparing → fixing → verifying → ci → reviewing → approve → approved
-/// → submitting → pr_open → merged/closed, or skipped/blocked/dropped.
+/// One bug moving through the office. `state`:
+/// vet → ready → repro → fix → ci → review → approve → approved → submit → done,
+/// or skipped / blocked / dropped. PR status (OPEN/MERGED/CLOSED) lives in `pr_state`.
 #[derive(Clone, Serialize)]
 pub struct Job {
     pub id: i64,
     pub repo: String,
+    /// GitHub issue number, 0 for a bug you described yourself ("direct").
     pub issue: i64,
+    pub kind: String,
     pub title: String,
     pub url: String,
     pub state: String,
     pub why: String,
-    /// Free-form details: issue body, branch, base commit, fix answer, proof, diff, PR text.
+    /// Details: issue body, branch, base, proof, fix answer, diff, PR text, agents involved.
     pub data: Value,
     pub pr_url: String,
     pub pr_state: String,
@@ -66,22 +82,23 @@ pub struct Job {
     pub updated: i64,
 }
 
-const COLS: &str = "id, repo, issue, title, url, state, why, data, pr_url, pr_state, created, updated";
+const COLS: &str = "id, repo, issue, kind, title, url, state, why, data, pr_url, pr_state, created, updated";
 
 fn job_row(r: &Row) -> rusqlite::Result<Job> {
     Ok(Job {
         id: r.get(0)?,
         repo: r.get(1)?,
         issue: r.get(2)?,
-        title: r.get(3)?,
-        url: r.get(4)?,
-        state: r.get(5)?,
-        why: r.get(6)?,
-        data: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or(json!({})),
-        pr_url: r.get(8)?,
-        pr_state: r.get(9)?,
-        created: r.get(10)?,
-        updated: r.get(11)?,
+        kind: r.get(3)?,
+        title: r.get(4)?,
+        url: r.get(5)?,
+        state: r.get(6)?,
+        why: r.get(7)?,
+        data: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or(json!({})),
+        pr_url: r.get(9)?,
+        pr_state: r.get(10)?,
+        created: r.get(11)?,
+        updated: r.get(12)?,
     })
 }
 
@@ -91,15 +108,17 @@ impl Db {
     pub fn open(path: &Path) -> anyhow::Result<Db> {
         let c = Connection::open(path)?;
         c.execute_batch(SCHEMA)?;
-        // Work that was cut off by a restart starts over; a cut-off submit waits for approval again.
-        c.execute("update jobs set state='queued', why='restarted' where state in ('preparing','fixing','verifying','ci','reviewing')", [])?;
-        c.execute("update jobs set state='approve', why='restarted while submitting, approve again' where state='submitting'", [])?;
+        // Work cut off by a restart starts over; a cut-off submit waits for approval again.
+        c.execute("update jobs set state='ready', why='restarted' where state in ('repro','fix','ci','review')", [])?;
+        c.execute("update jobs set state='approve', why='restarted while submitting, approve again' where state='submit'", [])?;
         Ok(Db(Mutex::new(c)))
     }
 
     fn c(&self) -> MutexGuard<'_, Connection> {
         self.0.lock().unwrap()
     }
+
+    // ---------------------------------------------------------------- repos
 
     pub fn repos(&self) -> Vec<Repo> {
         let c = self.c();
@@ -130,19 +149,21 @@ impl Db {
         self.c().execute("delete from repos where full=?1", params![full]).unwrap();
     }
 
-    pub fn seen(&self, repo: &str, issue: i64) -> bool {
-        self.c().query_row("select count(*) from jobs where repo=?1 and issue=?2", params![repo, issue], |r| r.get::<_, i64>(0)).unwrap_or(0) > 0
+    // ---------------------------------------------------------------- jobs
+
+    pub fn find_job(&self, repo: &str, issue: i64) -> Option<i64> {
+        self.c().query_row("select id from jobs where repo=?1 and issue=?2 and issue>0", params![repo, issue], |r| r.get(0)).optional().unwrap()
     }
 
-    pub fn add_job(&self, repo: &str, issue: i64, title: &str, url: &str, state: &str, why: &str, data: &Value) -> i64 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_job(&self, repo: &str, issue: i64, kind: &str, title: &str, url: &str, state: &str, why: &str, data: &Value) -> i64 {
         let c = self.c();
         c.execute(
-            "insert into jobs(repo, issue, title, url, state, why, data, created, updated) values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
-             on conflict(repo, issue) do update set title=excluded.title, state=excluded.state, why=excluded.why, data=excluded.data, updated=excluded.updated",
-            params![repo, issue, title, url, state, why, data.to_string(), now()],
+            "insert into jobs(repo, issue, kind, title, url, state, why, data, created, updated) values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+            params![repo, issue, kind, title, url, state, why, data.to_string(), now()],
         )
         .unwrap();
-        c.query_row("select id from jobs where repo=?1 and issue=?2", params![repo, issue], |r| r.get(0)).unwrap()
+        c.last_insert_rowid()
     }
 
     fn query_jobs(&self, tail: &str, p: impl Params) -> Vec<Job> {
@@ -156,13 +177,17 @@ impl Db {
         self.query_jobs("where id=?1", params![id]).pop()
     }
 
-    pub fn jobs(&self) -> Vec<Job> {
-        self.query_jobs("order by updated desc limit 300", [])
+    pub fn jobs(&self, limit: i64) -> Vec<Job> {
+        self.query_jobs("order by updated desc limit ?1", params![limit])
     }
 
-    /// Approved jobs go first so a PR you approved doesn't wait behind new fixes.
+    pub fn jobs_in(&self, state: &str) -> Vec<Job> {
+        self.query_jobs("where state=?1 order by id", params![state])
+    }
+
+    /// Approved jobs first, so a PR you approved doesn't wait behind new fixes.
     pub fn next_job(&self) -> Option<Job> {
-        self.query_jobs("where state in ('approved','queued') order by state='queued', id limit 1", []).pop()
+        self.query_jobs("where state in ('approved','ready') order by state='ready', id limit 1", []).pop()
     }
 
     pub fn open_prs(&self) -> Vec<Job> {
@@ -173,28 +198,66 @@ impl Db {
         self.c().execute("update jobs set state=?2, why=?3, updated=?4 where id=?1", params![id, state, why, now()]).unwrap();
     }
 
-    pub fn set_data(&self, id: i64, d: &Value) {
-        self.c().execute("update jobs set data=?2, updated=?3 where id=?1", params![id, d.to_string(), now()]).unwrap();
+    /// Read-modify-write of a job's `data` under one lock.
+    pub fn update_data(&self, id: i64, f: impl FnOnce(&mut Value)) {
+        let c = self.c();
+        let Some(s) = c.query_row("select data from jobs where id=?1", params![id], |r| r.get::<_, String>(0)).optional().unwrap() else { return };
+        let mut d: Value = serde_json::from_str(&s).unwrap_or(json!({}));
+        f(&mut d);
+        c.execute("update jobs set data=?2, updated=?3 where id=?1", params![id, d.to_string(), now()]).unwrap();
     }
 
     pub fn set_pr(&self, id: i64, url: &str, state: &str) {
         self.c().execute("update jobs set pr_url=?2, pr_state=?3, updated=?4 where id=?1", params![id, url, state, now()]).unwrap();
     }
 
+    pub fn counts(&self) -> Value {
+        let c = self.c();
+        let n = |s: &str| c.query_row("select count(*) from jobs where state=?1", params![s], |r| r.get::<_, i64>(0)).unwrap_or(0);
+        json!({"vet": n("vet"), "ready": n("ready"), "approve": n("approve"), "done": n("done")})
+    }
+
+    // ---------------------------------------------------------------- log, tokens, settings
+
     // ponytail: events grow forever; add "delete where t < now-30d" if the DB gets big.
-    pub fn event(&self, worker: &str, job: Option<i64>, msg: &str) {
-        self.c().execute("insert into events(t, worker, job, msg) values(?1, ?2, ?3, ?4)", params![now(), worker, job, msg]).unwrap();
+    pub fn event(&self, agent: &str, job: Option<i64>, msg: &str) {
+        self.c().execute("insert into events(t, agent, job, msg) values(?1, ?2, ?3, ?4)", params![now(), agent, job, msg]).unwrap();
     }
 
     pub fn events(&self, n: i64) -> Vec<Value> {
         let c = self.c();
-        let mut s = c.prepare("select t, worker, job, msg from events order by id desc limit ?1").unwrap();
+        let mut s = c.prepare("select t, agent, job, msg from events order by id desc limit ?1").unwrap();
         let mut v: Vec<Value> = s
-            .query_map(params![n], |r| Ok(json!({"t": r.get::<_, i64>(0)?, "worker": r.get::<_, String>(1)?, "job": r.get::<_, Option<i64>>(2)?, "msg": r.get::<_, String>(3)?})))
+            .query_map(params![n], |r| Ok(json!({"t": r.get::<_, i64>(0)?, "agent": r.get::<_, String>(1)?, "job": r.get::<_, Option<i64>>(2)?, "msg": r.get::<_, String>(3)?})))
             .unwrap()
             .filter_map(Result::ok)
             .collect();
         v.reverse();
         v
+    }
+
+    pub fn add_tokens(&self, agent: &str, tok: i64, usd: f64) {
+        self.c()
+            .execute(
+                "insert into tokens(day, agent, tok, usd) values(?1, ?2, ?3, ?4)
+                 on conflict(day, agent) do update set tok=tok+excluded.tok, usd=usd+excluded.usd",
+                params![day(), agent, tok, usd],
+            )
+            .unwrap();
+    }
+
+    pub fn tokens_today(&self) -> Map<String, Value> {
+        let c = self.c();
+        let mut s = c.prepare("select agent, tok from tokens where day=?1").unwrap();
+        let m = s.query_map(params![day()], |r| Ok((r.get::<_, String>(0)?, json!(r.get::<_, i64>(1)?)))).unwrap().filter_map(Result::ok).collect();
+        m
+    }
+
+    pub fn get(&self, k: &str) -> Option<String> {
+        self.c().query_row("select v from settings where k=?1", params![k], |r| r.get(0)).optional().unwrap()
+    }
+
+    pub fn set(&self, k: &str, v: &str) {
+        self.c().execute("insert into settings(k, v) values(?1, ?2) on conflict(k) do update set v=excluded.v", params![k, v]).unwrap();
     }
 }

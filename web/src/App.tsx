@@ -192,95 +192,40 @@ const INITIAL_AGENTS = [
   }
 ];
 
-const INITIAL_QUEUE = [
-  {
-    id: 'ao-testbed#6',
-    title: 'mean() is too small',
-    url: 'https://github.com/Silvertree2010/ao-testbed/pull/6',
-    status: 'DONE'
-  },
-  {
-    id: 'ao-testbed#4',
-    title: 'clamp() returns the lower bound for v...',
-    url: 'https://github.com/Silvertree2010/ao-testbed/pull/4',
-    status: 'DONE'
-  }
-];
+// --- LIVE DATA FROM THE MY OFFICE SERVER ---
+const H = { 'content-type': 'application/json', 'x-myoffice': '1' };
 
-const INITIAL_PRS = [
-  {
-    id: 'ao-testbed#7',
-    title: 'Fix mean() dividing by len(xs) + 1',
-    status: 'OPEN',
-    agentsInvolved: ['scout', 'repro', 'fixer', 'ci', 'reviewer', 'submit'],
-    file: 'src/ao_testbed/stats.py',
-    diffRemoved: '    return sum(xs) / (len(xs) + 1)',
-    diffAdded: '    return sum(xs) / len(xs)',
-    summary: 'Removes off-by-one denominator `+ 1` in arithmetic mean calculation.'
-  },
-  {
-    id: 'ao-testbed#5',
-    title: 'Return upper bound from clamp',
-    status: 'OPEN',
-    agentsInvolved: ['hunter', 'repro', 'fixer', 'reviewer', 'submit'],
-    file: 'src/ao_testbed/math_utils.py',
-    diffRemoved: '    if val > hi:\n        return lo',
-    diffAdded: '    if val > hi:\n        return hi',
-    summary: 'Fixes copy-paste bug where values exceeding `hi` returned `lo` instead of `hi`.'
-  }
-];
+async function api(path, body) {
+  const r = await fetch(path, { method: 'POST', headers: H, body: JSON.stringify(body || {}) });
+  const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+  if (j.error) alert(j.error);
+  return j;
+}
 
-const INITIAL_LOGS = [
-  { time: '01:14', agent: 'Submit', color: '#16a34a', text: 'PR opened: https://github.com/Silvertree2010/ao-testbed/pull/7' },
-  { time: '01:13', agent: 'Submit', color: '#16a34a', text: 'default branch unchanged, proofs still valid' },
-  { time: '01:13', agent: 'Submit', color: '#16a34a', text: 'pre-push gate for Silvertree2010/ao-testbed#6 passed' },
-  { time: '01:13', agent: 'Repro', color: '#dc2626', text: '[local] takes Silvertree2010/ao-testbed#6' },
-  { time: '01:13', agent: 'Submit', color: '#16a34a', text: 'Silvertree2010/ao-testbed#6 is ready and verified' },
-  { time: '01:13', agent: 'Submit', color: '#16a34a', text: 'default branch unchanged, proofs still valid' },
-  { time: '01:13', agent: 'Submit', color: '#16a34a', text: 'pre-push gate for Silvertree2010/ao-testbed#4 passed' },
-  { time: '01:13', agent: 'Reviewer', color: '#db2777', text: 'ok' },
-  { time: '01:13', agent: 'CI', color: '#059669', text: 'green after 0 min' },
-  { time: '01:13', agent: 'CI', color: '#059669', text: '. .venv/bin/activate && pytest running for ao-testbed' }
-];
+const EMPTY: any = { paused: false, machine: {}, counts: { vet: 0, ready: 0, approve: 0, done: 0 }, agents: {}, jobs: [], events: [], repos: [] };
 
-const SAMPLE_BUG_SCENARIOS = [
-  {
-    issueId: 'ao-testbed#8',
-    issueTitle: 'fibonacci(0) raises IndexError on empty cache',
-    prId: 'ao-testbed#9',
-    prTitle: 'Guard base-case n <= 0 in fibonacci()',
-    reproTask: '[local] takes Silvertree2010/ao-testbed#8',
-    fixerTask: 'done: Guard base-case n <= 0 in fib...',
-    file: 'src/ao_testbed/seq.py',
-    diffRemoved: '    if n == 1:\n        return 1',
-    diffAdded: '    if n <= 0:\n        return 0\n    if n == 1:\n        return 1',
-    summary: 'Handles zero and negative inputs cleanly before indexing cache.'
-  },
-  {
-    issueId: 'ao-testbed#10',
-    issueTitle: 'matrix_transpose() drops last column on non-square',
-    prId: 'ao-testbed#11',
-    prTitle: 'Use zip(*matrix) bounds in transpose()',
-    reproTask: '[local] takes Silvertree2010/ao-testbed#10',
-    fixerTask: 'done: Fix col range in matrix_trans...',
-    file: 'src/ao_testbed/linalg.py',
-    diffRemoved: '    return [[row[i] for row in m] for i in range(len(m))]',
-    diffAdded: '    return [list(col) for col in zip(*m)]',
-    summary: 'Iterates over full column width instead of row count.'
-  },
-  {
-    issueId: 'ao-testbed#12',
-    issueTitle: 'parse_semver() fails when pre-release has hyphen',
-    prId: 'ao-testbed#13',
-    prTitle: 'Split semver on first hyphen only',
-    reproTask: '[local] takes Silvertree2010/ao-testbed#12',
-    fixerTask: 'done: Split maxsplit=1 in semver...',
-    file: 'src/ao_testbed/version.py',
-    diffRemoved: '    core, pre = version_str.split("-")',
-    diffAdded: '    core, pre = version_str.split("-", 1)',
-    summary: 'Limits hyphen split to `maxsplit=1` so multi-hyphen pre-releases parse properly.'
-  }
-];
+// Snapshot from /api/state, reloaded whenever the server announces something on /events.
+function useOffice() {
+  const [s, setS] = useState(EMPTY);
+  const [online, setOnline] = useState(false);
+  useEffect(() => {
+    let timer = null;
+    const load = () => fetch('/api/state').then((r) => r.json()).then(setS).catch(() => {});
+    const es = new EventSource('/events');
+    es.onopen = () => { setOnline(true); load(); };
+    es.onerror = () => setOnline(false);
+    es.onmessage = () => { clearTimeout(timer); timer = setTimeout(load, 250); };
+    return () => { es.close(); clearTimeout(timer); };
+  }, []);
+  return { ...s, online };
+}
+
+const RUNNING = ['repro', 'fix', 'ci', 'review', 'submit', 'approved'];
+const fmtTime = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const STATE_BADGE = {
+  done: 'bg-emerald-300', vet: 'bg-purple-200', ready: 'bg-sky-200',
+  dropped: 'bg-rose-300', skipped: 'bg-zinc-200', blocked: 'bg-rose-300'
+};
 
 // --- CUSTOM CHIBI MANGA BOT SVG COMPONENT ---
 const ChibiBotDesk = ({ 
@@ -653,52 +598,72 @@ const StudioBoombox = ({ playing, onToggle }) => {
 };
 
 export default function App() {
-  const [agents, setAgents] = useState(INITIAL_AGENTS);
-  const [queue, setQueue] = useState(INITIAL_QUEUE);
-  const [activeWaitTask, setActiveWaitTask] = useState(null);
-  const [prs, setPrs] = useState(INITIAL_PRS);
-  const [logs, setLogs] = useState(INITIAL_LOGS);
+  const office = useOffice();
   const [logSearch, setLogSearch] = useState('');
 
   const [selectedAgentId, setSelectedAgentId] = useState('fixer');
   const [highlightedPrId, setHighlightedPrId] = useState(null);
-  const [inspectedPr, setInspectedPr] = useState(null); // Opens Manga Diff Manuscript Modal
+  const [inspectedPr, setInspectedPr] = useState(null); // full job from /api/job, opens the Diff Manuscript modal
   const [activeHeaderModal, setActiveHeaderModal] = useState(null); // 'repos' | 'machines' | null
   const [selectedBlade, setSelectedBlade] = useState(0);
 
-  const [themeMode, setThemeMode] = useState('paper'); // 'paper' | 'shonen' | 'midnight'
+  const [themeMode, setThemeMode] = useState(() => {
+    try { return localStorage.getItem('myoffice-theme') || 'paper'; } catch { return 'paper'; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('myoffice-theme', themeMode); } catch {}
+  }, [themeMode]);
   const [lofiPlaying, setLofiPlaying] = useState(true);
-  const [officePaused, setOfficePaused] = useState(false);
   const [matchaAgentId, setMatchaAgentId] = useState(null);
+  const [localLogs, setLocalLogs] = useState([]); // matcha moments stay in the browser
+  const [clockStr, setClockStr] = useState('');
 
-  // Simulation state
-  const [isSimulating, setIsSimulating] = useState(false);
-  const [simStepText, setSimStepText] = useState('');
-  const [scenarioIdx, setScenarioIdx] = useState(0);
-  const [clockStr, setClockStr] = useState('01:14');
-  const [doneCount, setDoneCount] = useState(2);
-
-  // Custom modal for adding a custom bug
   const [showNewBugModal, setShowNewBugModal] = useState(false);
   const [customBugTitle, setCustomBugTitle] = useState('');
-
-  const timeoutsRef = useRef([]);
+  const [newBugRepo, setNewBugRepo] = useState('');
+  const [repoForm, setRepoForm] = useState({ full: '', test_cmd: '', auto: false });
 
   useEffect(() => {
-    return () => timeoutsRef.current.forEach(clearTimeout);
+    const tick = () => setClockStr(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    tick();
+    const interval = setInterval(tick, 5000);
+    return () => clearInterval(interval);
   }, []);
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (!officePaused) {
-        const now = new Date();
-        const mins = String(now.getMinutes()).padStart(2, '0');
-        const secs = String(now.getSeconds()).padStart(2, '0');
-        setClockStr(`${mins}:${secs}`);
-      }
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [officePaused]);
+  // Static look (colors, accessories, bios) + live state from the server.
+  const agents = INITIAL_AGENTS.map((a) => {
+    const l = office.agents[a.id];
+    if (!l) return { ...a, status: 'IDLE', tokens: 0, taskText: '—' };
+    return {
+      ...a,
+      status: l.status,
+      tokens: l.tokens,
+      taskText: l.task || '—',
+      model: l.model,
+      speech: l.speech || a.speech,
+      promptSnippet: l.tool || a.promptSnippet
+    };
+  });
+  const agentById = (id) => INITIAL_AGENTS.find((a) => a.id === id);
+  const officePaused = office.paused;
+
+  const jobs = office.jobs;
+  const activeJob = jobs.find((j) => RUNNING.includes(j.state));
+  const waitingJobs = jobs.filter((j) => j.state === 'approve');
+  const queue = jobs.filter((j) => !RUNNING.includes(j.state) && j.state !== 'approve').slice(0, 30);
+  const prs = jobs.filter((j) => j.pr_url).map((j) => ({ ...j, status: j.pr_state, title: j.pr_title || j.title, agentsInvolved: j.agents || [] }));
+  const workingAgent = agents.find((a) => a.status === 'WORKING');
+  const isSimulating = !!workingAgent;
+  const simStepText = workingAgent ? `${workingAgent.name}: ${workingAgent.taskText}` : '';
+  const doneCount = office.counts.done;
+
+  const logs = [
+    ...office.events.map((e) => {
+      const a = agentById(e.agent);
+      return { t: e.t, time: fmtTime(e.t), agent: a ? a.name[0] + a.name.slice(1).toLowerCase() : e.agent, color: a?.darkColor || '#71717a', text: e.msg };
+    }),
+    ...localLogs
+  ].sort((x, y) => y.t - x.t);
 
   const selectedAgent = agents.find((a) => a.id === selectedAgentId) || agents[0];
   const highlightedPr = prs.find((p) => p.id === highlightedPrId);
@@ -706,241 +671,44 @@ export default function App() {
   const openPrCount = prs.filter((p) => p.status === 'OPEN').length;
   const mergedPrCount = prs.filter((p) => p.status === 'MERGED').length;
 
-  const updateAgent = (id, patch) => {
-    setAgents((prev) =>
-      prev.map((ag) => (ag.id === id ? { ...ag, ...patch } : ag))
-    );
-  };
-
-  const pushLog = (agentName, color, text) => {
-    const now = new Date();
-    const t = `01:${String(14 + (now.getSeconds() % 45)).padStart(2, '0')}`;
-    setLogs((prev) => [{ time: t, agent: agentName, color, text }, ...prev.slice(0, 39)]);
-  };
-
   const handleGiveMatcha = (agentId) => {
     setMatchaAgentId(agentId);
     const target = agents.find((a) => a.id === agentId);
     if (target) {
-      pushLog(target.name, target.darkColor, `received a warm Matcha Latte in MY OFFICE 🍵 (+100 Morale!)`);
+      const t = Date.now() / 1000;
+      setLocalLogs((prev) => [{ t, time: fmtTime(t), agent: target.name, color: target.darkColor, text: 'received a warm Matcha Latte in MY OFFICE 🍵 (+100 Morale!)' }, ...prev].slice(0, 20));
     }
-    setTimeout(() => {
-      setMatchaAgentId(null);
-    }, 2600);
+    setTimeout(() => setMatchaAgentId(null), 2600);
   };
 
-  const handleChangeAgentModel = (agentId, newModel) => {
-    updateAgent(agentId, { model: newModel });
-    const target = agents.find((a) => a.id === agentId);
-    if (target) {
-      pushLog(target.name, target.darkColor, `switched model engine to ${newModel}`);
-    }
-  };
+  const handleChangeAgentModel = (agentId, newModel) => api('/api/agent/model', { agent: agentId, model: newModel });
 
-  const handleSoloAgentAction = (agent) => {
-    updateAgent(agent.id, { status: 'WORKING' });
-    pushLog(agent.name, agent.darkColor, `running solo diagnostic check (${agent.sfx})...`);
-    setTimeout(() => {
-      updateAgent(agent.id, { status: 'IDLE', tokens: agent.tokens + 2 });
-      pushLog(agent.name, agent.darkColor, `diagnostic complete — all checks nominal!`);
-    }, 1800);
-  };
+  // "Test Agent": a tiny real request with the agent's model.
+  const handleSoloAgentAction = (agent) => api('/api/agent/test', { agent: agent.id });
 
-  const handleMergePr = (prId, e) => {
+  const handleMergePr = async (prId, e) => {
     if (e) e.stopPropagation();
-    setPrs((prev) =>
-      prev.map((p) => (p.id === prId ? { ...p, status: 'MERGED' } : p))
-    );
-    if (inspectedPr && inspectedPr.id === prId) {
-      setInspectedPr((prev) => ({ ...prev, status: 'MERGED' }));
-    }
-    pushLog('Submit', '#059669', `merged Pull Request ${prId} into main branch! ドーン! 🎉`);
+    if (!confirm('Merge this pull request on GitHub now?')) return;
+    const r = await api('/api/pr/merge', { id: prId });
+    if (r.ok && inspectedPr?.id === prId) setInspectedPr(null);
   };
 
-  // Trigger full multi-agent bug-hunt simulation across MY OFFICE!
-  const startBugHuntSimulation = (customTitle = null) => {
-    if (isSimulating) return;
-    setOfficePaused(false);
-    setIsSimulating(true);
-    setHighlightedPrId(null);
+  const openJob = async (id) => setInspectedPr(await (await fetch(`/api/job?id=${id}`)).json());
 
-    const baseScenario = SAMPLE_BUG_SCENARIOS[scenarioIdx % SAMPLE_BUG_SCENARIOS.length];
-    const scenario = customTitle
-      ? {
-          issueId: `ao-testbed#${14 + scenarioIdx}`,
-          issueTitle: customTitle,
-          prId: `ao-testbed#${15 + scenarioIdx}`,
-          prTitle: `Fix: ${customTitle.slice(0, 34)}`,
-          reproTask: `[local] takes Silvertree2010/ao-testbed#${14 + scenarioIdx}`,
-          fixerTask: `done: ${customTitle.slice(0, 28)}...`,
-          file: 'src/ao_testbed/core.py',
-          diffRemoved: '    return process_unverified(data)',
-          diffAdded: '    if not data:\n        return []\n    return process_verified(data)',
-          summary: `Automated MY OFFICE patch resolving "${customTitle}".`
-        }
-      : baseScenario;
+  const jobAction = async (id, action) => {
+    const r = await api('/api/job/action', { id, action });
+    if (r.ok) setInspectedPr(null);
+  };
 
-    setScenarioIdx((i) => i + 1);
+  // "Run Full Pipeline": Scout checks every repository now.
+  const startBugHuntSimulation = () => api('/api/scan');
 
-    timeoutsRef.current.forEach(clearTimeout);
-    timeoutsRef.current = [];
+  const dispatchNewIssue = () =>
+    api('/api/issue', { repo: newBugRepo || office.repos[0]?.full || '', text: customBugTitle.trim() });
 
-    const schedule = (ms, fn) => {
-      const id = setTimeout(fn, ms);
-      timeoutsRef.current.push(id);
-    };
-
-    // Step 1: Issue arrives in Queue & SCOUT wakes up
-    setActiveWaitTask({ id: scenario.issueId, title: scenario.issueTitle });
-    setSimStepText(`PANEL 1: SCOUT spotted ${scenario.issueId} in MY OFFICE!`);
-    setSelectedAgentId('scout');
-    updateAgent('scout', {
-      status: 'WORKING',
-      tokens: 18,
-      taskText: `scanning ${scenario.issueId}`,
-      speech: `New bug manuscript spotted: "${scenario.issueTitle}"! 🔭`
-    });
-    pushLog('Scout', '#0d9488', `detected new issue ${scenario.issueId}: ${scenario.issueTitle}`);
-
-    // Step 2: VET Triplets & GUARD triage
-    schedule(1800, () => {
-      updateAgent('scout', { status: 'IDLE', taskText: '—' });
-      updateAgent('vet', {
-        status: 'WORKING',
-        tokens: 6,
-        taskText: `vetting ${scenario.issueId}`,
-        speech: `Triplets confirming bug validity! 100% reproducible spec!`
-      });
-      updateAgent('guard', {
-        status: 'WORKING',
-        tokens: 5,
-        taskText: 'checking sandbox',
-        speech: `Sandbox permissions verified for ${scenario.issueId}! 🛡️`
-      });
-      setSelectedAgentId('vet');
-      setSimStepText(`PANEL 2: VET Triplets & GUARD triaging ${scenario.issueId}...`);
-      pushLog('Vet', '#7c3aed', `triage passed for ${scenario.issueId} (priority: HIGH)`);
-    });
-
-    // Step 3: HUNTER & REPRO reproduce the bug
-    schedule(3600, () => {
-      updateAgent('vet', { status: 'IDLE', taskText: '—' });
-      updateAgent('guard', { status: 'IDLE', taskText: '—' });
-      updateAgent('hunter', {
-        status: 'WORKING',
-        tokens: 14,
-        taskText: `locating AST node`,
-        speech: `Aha! Found the exact faulty expression in ${scenario.file}! 🔍`
-      });
-      updateAgent('repro', {
-        status: 'WORKING',
-        tokens: 39,
-        taskText: scenario.reproTask,
-        speech: `Sketching failing pytest script for ${scenario.issueId}! ✍️`
-      });
-      setSelectedAgentId('repro');
-      setSimStepText(`PANEL 3: HUNTER & REPRO isolating failing test...`);
-      pushLog('Repro', '#dc2626', scenario.reproTask);
-    });
-
-    // Step 4: FIXER inks the code patch!
-    schedule(5600, () => {
-      updateAgent('hunter', { status: 'IDLE', taskText: '—' });
-      updateAgent('repro', { status: 'IDLE' });
-      updateAgent('fixer', {
-        status: 'WORKING',
-        tokens: 542,
-        taskText: `patching ${scenario.issueId}...`,
-        speech: `MAXIMUM MANGA SPEED! Inking the surgical patch right now!! 🖊️🔥`
-      });
-      setSelectedAgentId('fixer');
-      setSimStepText(`PANEL 4: FIXER (Sonnet) inking surgical patch...`);
-      pushLog('Fixer', '#ea580c', `applying AST patch for ${scenario.issueId} (+41k tok)`);
-    });
-
-    // Step 5: CI runs pytest on the ME Server Rack
-    schedule(7600, () => {
-      updateAgent('fixer', {
-        status: 'IDLE',
-        taskText: scenario.fixerTask,
-        speech: `Patch complete! Passing manuscript to ME CI shrine! ✨`
-      });
-      updateAgent('ci', {
-        status: 'WORKING',
-        taskText: 'pytest running...',
-        speech: `Running .venv/bin/activate && pytest inside ME rack!`
-      });
-      setSelectedAgentId('ci');
-      setSimStepText(`PANEL 5: CI Machine (ME) running unit tests...`);
-      pushLog('CI', '#059669', `. .venv/bin/activate && pytest running for ${scenario.issueId}`);
-    });
-
-    // Step 6: REVIEWER stamps OK
-    schedule(9400, () => {
-      updateAgent('ci', {
-        status: 'IDLE',
-        taskText: 'green after 0 min',
-        speech: `All tests GREEN in 0 min! Zero regressions! 🌱`
-      });
-      pushLog('CI', '#059669', `green after 0 min`);
-
-      updateAgent('reviewer', {
-        status: 'WORKING',
-        tokens: 8,
-        taskText: `reviewing ${scenario.prId}`,
-        speech: `Checking invariants with my red brush... Stamp of Approval: ok! 🌸`
-      });
-      setSelectedAgentId('reviewer');
-      setSimStepText(`PANEL 6: REVIEWER inspecting code quality...`);
-      pushLog('Reviewer', '#db2777', `ok`);
-    });
-
-    // Step 7: SUBMIT publishes PR & moves Queue item to DONE
-    schedule(11200, () => {
-      updateAgent('reviewer', { status: 'IDLE', taskText: 'ok' });
-      updateAgent('submit', {
-        status: 'WORKING',
-        taskText: `PR opened: ${scenario.prId}`,
-        speech: `Dispatching Pull Request ${scenario.prId} from MY OFFICE to GitHub! 🚀`
-      });
-      setSelectedAgentId('submit');
-      setSimStepText(`FINAL PANEL: SUBMIT opening Pull Request ${scenario.prId}! ドーン!`);
-
-      pushLog('Submit', '#16a34a', `pre-push gate for Silvertree2010/${scenario.issueId} passed`);
-      pushLog('Submit', '#16a34a', `PR opened: https://github.com/Silvertree2010/ao-testbed/pull/${scenario.prId.split('#')[1]}`);
-
-      setActiveWaitTask(null);
-      setQueue((prev) => [
-        {
-          id: scenario.issueId,
-          title: scenario.issueTitle,
-          url: `https://github.com/Silvertree2010/ao-testbed/pull/${scenario.issueId.split('#')[1]}`,
-          status: 'DONE'
-        },
-        ...prev
-      ]);
-
-      setPrs((prev) => [
-        {
-          id: scenario.prId,
-          title: scenario.prTitle,
-          status: 'OPEN',
-          agentsInvolved: ['scout', 'vet', 'repro', 'fixer', 'ci', 'reviewer', 'submit'],
-          file: scenario.file,
-          diffRemoved: scenario.diffRemoved,
-          diffAdded: scenario.diffAdded,
-          summary: scenario.summary
-        },
-        ...prev
-      ]);
-      setDoneCount((c) => c + 1);
-    });
-
-    schedule(12800, () => {
-      updateAgent('submit', { status: 'IDLE' });
-      setIsSimulating(false);
-      setSimStepText('');
-    });
+  const saveRepo = async () => {
+    const r = await api('/api/repo', repoForm);
+    if (r.ok) setRepoForm({ full: '', test_cmd: '', auto: false });
   };
 
   // Theme palette classes
@@ -1053,7 +821,7 @@ export default function App() {
           {/* Online Stamp */}
           <span className="px-2.5 py-0.5 rounded-full text-xs font-black border-2 border-[#1a1a1a] bg-emerald-300 text-[#1a1a1a] shadow-[2px_2px_0px_#1a1a1a] flex items-center gap-1.5">
             <span className="w-2 h-2 rounded-full bg-emerald-700 animate-ping" />
-            {officePaused ? 'paused' : 'online'}
+            {officePaused ? 'paused' : office.online ? 'online' : 'offline'}
           </span>
 
           {/* Local Stamp */}
@@ -1063,11 +831,11 @@ export default function App() {
 
           {/* Pipeline Counter Strip */}
           <div className="hidden xl:flex items-center gap-2 px-3 py-1 rounded-md border-2 border-[#1a1a1a] bg-white text-[#1a1a1a] font-mono text-xs font-bold shadow-[2px_2px_0px_#1a1a1a]">
-            <span>vet <strong className="text-purple-600">{isSimulating ? 1 : 0}</strong></span>
+            <span>vet <strong className="text-purple-600">{office.counts.vet}</strong></span>
             <span>·</span>
-            <span>ready <strong className="text-sky-600">0</strong></span>
+            <span>ready <strong className="text-sky-600">{office.counts.ready}</strong></span>
             <span>·</span>
-            <span>approve <strong className="text-pink-600">0</strong></span>
+            <span>approve <strong className="text-pink-600">{office.counts.approve}</strong></span>
             <span>·</span>
             <span>done <strong className="text-emerald-600">{doneCount}</strong></span>
           </div>
@@ -1078,7 +846,6 @@ export default function App() {
           {/* Run Full Pipeline CTA */}
           <button
             onClick={() => startBugHuntSimulation()}
-            disabled={isSimulating}
             className={`manga-btn px-3 py-1.5 rounded-md font-black text-xs flex items-center gap-1.5 ${
               isSimulating
                 ? 'bg-yellow-300 text-[#1a1a1a] cursor-wait'
@@ -1137,7 +904,7 @@ export default function App() {
 
           {/* Pause Office Button (From screenshot top-right) */}
           <button
-            onClick={() => setOfficePaused(!officePaused)}
+            onClick={() => api('/api/office/pause', { paused: !officePaused })}
             className={`manga-btn px-2.5 py-1.5 rounded-md text-xs font-black flex items-center gap-1 ${
               officePaused ? 'bg-rose-300 text-[#1a1a1a]' : 'bg-white text-[#1a1a1a]'
             }`}
@@ -1256,7 +1023,7 @@ export default function App() {
                   <span className="w-2.5 h-2.5 rounded-xs bg-emerald-400 inline-block animate-pulse" />
                 </div>
                 <div className="font-mono text-xs text-zinc-300 tracking-widest w-full text-left mt-0.5">
-                  Q {activeWaitTask ? 1 : 0} &nbsp; PR {openPrCount}
+                  Q {waitingJobs.length + (activeJob ? 1 : 0)} &nbsp; PR {openPrCount}
                 </div>
               </div>
 
@@ -1495,7 +1262,7 @@ export default function App() {
                               <div className="bg-emerald-500 h-full w-1/3" />
                             </div>
                             <div className="text-[9px] font-mono opacity-75">
-                              CPU 14% · VRAM 2.1GB
+                              {office.machine.cpus || "?"} CPUs · {office.machine.docker ? "docker" : "local, no sandbox"}
                             </div>
                           </div>
                         </div>
@@ -1555,13 +1322,14 @@ export default function App() {
                 <span className="text-[10px] font-black uppercase">Model:</span>
                 <select
                   value={selectedAgent.model}
+                  disabled={selectedAgent.model === 'no model'}
                   onChange={(e) => handleChangeAgentModel(selectedAgent.id, e.target.value)}
                   className="text-xs font-mono font-black bg-transparent focus:outline-none cursor-pointer"
                 >
                   <option value="Haiku">Haiku</option>
                   <option value="Sonnet">Sonnet</option>
                   <option value="Opus">Opus</option>
-                  <option value="no model">no model</option>
+                  {selectedAgent.model === 'no model' && <option value="no model">no model</option>}
                 </select>
               </div>
 
@@ -1595,47 +1363,84 @@ export default function App() {
                 <span className="text-[11px] font-mono opacity-60">キュー</span>
               </div>
               <span className="text-xs font-mono font-bold">
-                {activeWaitTask ? '1 waiting' : 'nothing waiting'}
+                {waitingJobs.length ? `${waitingJobs.length} waiting for you` : activeJob ? '1 in progress' : 'nothing waiting'}
               </span>
             </div>
 
-            {activeWaitTask ? (
-              <div className="mb-3 p-2.5 rounded-lg border-2 border-[#1a1a1a] bg-yellow-200 text-[#1a1a1a] shadow-[2px_2px_0px_#1a1a1a] animate-pulse">
+            {activeJob ? (
+              <div
+                onClick={() => openJob(activeJob.id)}
+                className="mb-3 p-2.5 rounded-lg border-2 border-[#1a1a1a] bg-yellow-200 text-[#1a1a1a] shadow-[2px_2px_0px_#1a1a1a] animate-pulse cursor-pointer"
+              >
                 <div className="flex items-center justify-between text-xs font-black">
-                  <span className="bg-rose-500 text-white px-1.5 py-0.5 rounded text-[10px]">IN PROGRESS</span>
-                  <span className="font-mono">{activeWaitTask.id}</span>
+                  <span className="bg-rose-500 text-white px-1.5 py-0.5 rounded text-[10px]">IN PROGRESS · {activeJob.state.toUpperCase()}</span>
+                  <span className="font-mono">{activeJob.label}</span>
                 </div>
-                <div className="font-bold text-xs mt-1">{activeWaitTask.title}</div>
+                <div className="font-bold text-xs mt-1">{activeJob.title}</div>
+                <div className="text-[10px] font-mono opacity-70 mt-0.5">{activeJob.why}</div>
               </div>
             ) : (
-              <div className="text-xs font-mono opacity-60 mb-3">
-                nothing waiting
-              </div>
+              !waitingJobs.length && <div className="text-xs font-mono opacity-60 mb-3">nothing waiting</div>
             )}
+
+            {/* Verified fixes that need your OK before Submit pushes anything */}
+            {waitingJobs.map((j) => (
+              <div key={j.id} className="mb-3 p-2.5 rounded-lg border-2 border-[#1a1a1a] bg-pink-100 text-[#1a1a1a] shadow-[2px_2px_0px_#1a1a1a]">
+                <div className="flex items-center justify-between text-xs font-black">
+                  <span className="bg-pink-500 text-white px-1.5 py-0.5 rounded text-[10px]">WAITING FOR YOU · 承認</span>
+                  <span className="font-mono">{j.label}</span>
+                </div>
+                <div className="font-bold text-xs mt-1">{j.pr_title || j.title}</div>
+                <div className="text-[10px] font-mono opacity-70 mt-0.5 truncate">{j.why}</div>
+                <div className="flex items-center gap-1.5 mt-2 text-[10px]">
+                  <button
+                    onClick={() => openJob(j.id)}
+                    className="px-2 py-0.5 rounded border border-[#1a1a1a] bg-amber-100 font-bold flex items-center gap-1 hover:bg-amber-200"
+                  >
+                    <FileCode2 className="w-3 h-3" /> Diff
+                  </button>
+                  <button
+                    onClick={() => jobAction(j.id, 'approve')}
+                    className="px-2 py-0.5 rounded border border-[#1a1a1a] bg-emerald-300 font-black flex items-center gap-1 hover:bg-emerald-400"
+                  >
+                    <CheckCircle2 className="w-3 h-3" /> Approve & open PR
+                  </button>
+                  <button
+                    onClick={() => jobAction(j.id, 'reject')}
+                    className="px-2 py-0.5 rounded border border-[#1a1a1a] bg-rose-200 font-bold flex items-center gap-1 hover:bg-rose-300"
+                  >
+                    <X className="w-3 h-3" /> Reject
+                  </button>
+                </div>
+              </div>
+            ))}
 
             <div className="text-[10px] font-mono font-black uppercase tracking-wider opacity-60 mb-2">
               RECENT
             </div>
 
             <div className="flex flex-col gap-2.5 max-h-[175px] overflow-y-auto pr-1">
+              {queue.length === 0 && <div className="text-xs font-mono opacity-60">no jobs yet — add a repo, then ⚡ Run Full Pipeline</div>}
               {queue.map((item) => (
                 <div
                   key={item.id}
-                  className={`p-2.5 rounded-lg border-2 border-[#1a1a1a] ${theme.cardBg} flex items-start justify-between gap-2 shadow-[2px_2px_0px_#1a1a1a]`}
+                  onClick={() => openJob(item.id)}
+                  title={item.why}
+                  className={`p-2.5 rounded-lg border-2 border-[#1a1a1a] ${theme.cardBg} flex items-start justify-between gap-2 shadow-[2px_2px_0px_#1a1a1a] cursor-pointer`}
                 >
                   <div className="flex items-start gap-2 min-w-0">
-                    <span className="px-2 py-0.5 rounded border-2 border-[#1a1a1a] bg-emerald-300 text-[#1a1a1a] font-mono font-black text-[10px] shrink-0 shadow-[1px_1px_0px_#1a1a1a]">
-                      DONE
+                    <span className={`px-2 py-0.5 rounded border-2 border-[#1a1a1a] ${STATE_BADGE[item.state] || 'bg-zinc-200'} text-[#1a1a1a] font-mono font-black text-[10px] shrink-0 shadow-[1px_1px_0px_#1a1a1a]`}>
+                      {item.state.toUpperCase()}
                     </span>
                     <div className="min-w-0">
                       <div className="font-bold text-xs truncate">{item.title}</div>
                       <div className="text-[10px] font-mono opacity-60 truncate">
-                        {item.url}
+                        {item.pr_url || item.why || item.url}
                       </div>
                     </div>
                   </div>
                   <span className="text-[11px] font-mono opacity-75 shrink-0">
-                    {item.id}
+                    {item.label}
                   </span>
                 </div>
               ))}
@@ -1664,9 +1469,10 @@ export default function App() {
             </div>
 
             <div className="flex flex-col gap-2.5 max-h-[195px] overflow-y-auto pr-1">
+              {prs.length === 0 && <div className="text-xs font-mono opacity-60">no pull requests yet</div>}
               {prs.map((pr) => {
                 const isSelectedPr = highlightedPrId === pr.id;
-                const isMerged = pr.status === 'MERGED';
+                const isMerged = pr.status !== 'OPEN';
                 return (
                   <div
                     key={pr.id}
@@ -1681,8 +1487,10 @@ export default function App() {
                       <div className="flex items-center gap-2 min-w-0">
                         <span
                           className={`px-2 py-0.5 rounded border-2 border-[#1a1a1a] font-mono font-black text-[10px] shrink-0 ${
-                            isMerged
+                            pr.status === 'MERGED'
                               ? 'bg-purple-300 text-[#1a1a1a]'
+                              : pr.status === 'CLOSED'
+                              ? 'bg-zinc-300 text-[#1a1a1a]'
                               : 'bg-sky-300 text-[#1a1a1a]'
                           }`}
                         >
@@ -1692,25 +1500,25 @@ export default function App() {
                           {pr.title}
                         </span>
                       </div>
-                      <span className="text-[11px] font-mono opacity-75 shrink-0">
-                        {pr.id}
-                      </span>
+                      <a href={pr.pr_url} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()} className="text-[11px] font-mono opacity-75 shrink-0 underline">
+                        {pr.label}
+                      </a>
                     </div>
 
                     {/* Interactive PR Actions: Inspect Diff Manuscript or Merge */}
                     <div className="flex items-center justify-between pt-1 border-t border-dashed border-zinc-300/70 text-[10px]">
-                      <span className="font-mono opacity-65 truncate">{pr.file}</span>
+                      <span className="font-mono opacity-65 truncate">{pr.file || ''}</span>
                       <div className="flex items-center gap-1.5">
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            setInspectedPr(pr);
+                            openJob(pr.id);
                           }}
                           className="px-2 py-0.5 rounded border border-[#1a1a1a] bg-amber-100 text-[#1a1a1a] font-bold flex items-center gap-1 hover:bg-amber-200"
                         >
                           <FileCode2 className="w-3 h-3" /> Diff
                         </button>
-                        {!isMerged && (
+                        {!isMerged && pr.can_merge && (
                           <button
                             onClick={(e) => handleMergePr(pr.id, e)}
                             className="px-2 py-0.5 rounded border border-[#1a1a1a] bg-emerald-300 text-[#1a1a1a] font-black flex items-center gap-1 hover:bg-emerald-400"
@@ -1770,63 +1578,117 @@ export default function App() {
       </main>
 
       {/* ==================== MODAL 1: MANGA GIT DIFF MANUSCRIPT VIEWER ==================== */}
-      {inspectedPr && (
-        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="manga-panel rounded-2xl bg-[#fffdf9] text-[#1a1a1a] max-w-lg w-full p-5 relative">
-            <button
-              onClick={() => setInspectedPr(null)}
-              className="absolute top-3 right-3 w-7 h-7 rounded-full border-2 border-[#1a1a1a] bg-rose-300 flex items-center justify-center font-black"
-            >
-              <X className="w-4 h-4" />
-            </button>
+      {inspectedPr && (() => {
+        const d = inspectedPr.data || {};
+        const fix = d.fix || {};
+        const proof = d.proof || {};
+        const status = inspectedPr.pr_state || inspectedPr.state.toUpperCase();
+        return (
+          <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4" onClick={() => setInspectedPr(null)}>
+            <div className="manga-panel rounded-2xl bg-[#fffdf9] text-[#1a1a1a] max-w-3xl w-full p-5 relative max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+              <button
+                onClick={() => setInspectedPr(null)}
+                className="absolute top-3 right-3 w-7 h-7 rounded-full border-2 border-[#1a1a1a] bg-rose-300 flex items-center justify-center font-black"
+              >
+                <X className="w-4 h-4" />
+              </button>
 
-            <div className="flex items-center gap-2 mb-2">
-              <span className="px-2 py-0.5 bg-[#1a1a1a] text-white font-black text-xs rounded">
-                MY OFFICE PATCH MANUSCRIPT
-              </span>
-              <span className="font-mono text-xs font-bold">{inspectedPr.id}</span>
-              <span className="px-2 py-0.5 rounded border border-[#1a1a1a] bg-sky-200 text-[10px] font-black">
-                {inspectedPr.status}
-              </span>
-            </div>
-
-            <h3 className="font-black text-base mb-1">{inspectedPr.title}</h3>
-            <p className="text-xs opacity-80 mb-3">{inspectedPr.summary}</p>
-
-            <div className="rounded-xl border-2 border-[#1a1a1a] bg-[#18181b] text-zinc-100 p-3 font-mono text-xs mb-4 shadow-[3px_3px_0px_#1a1a1a]">
-              <div className="text-[10px] text-zinc-400 border-b border-zinc-700 pb-1 mb-2">
-                --- a/{inspectedPr.file} <br />
-                +++ b/{inspectedPr.file}
+              <div className="flex flex-wrap items-center gap-2 mb-2 pr-8">
+                <span className="px-2 py-0.5 bg-[#1a1a1a] text-white font-black text-xs rounded">
+                  MY OFFICE PATCH MANUSCRIPT
+                </span>
+                <span className="font-mono text-xs font-bold">{inspectedPr.label}</span>
+                <span className="px-2 py-0.5 rounded border border-[#1a1a1a] bg-sky-200 text-[10px] font-black">{status}</span>
+                {inspectedPr.url && <a href={inspectedPr.url} target="_blank" rel="noopener noreferrer" className="text-[11px] font-bold underline text-indigo-700">issue</a>}
+                {inspectedPr.pr_url && <a href={inspectedPr.pr_url} target="_blank" rel="noopener noreferrer" className="text-[11px] font-bold underline text-indigo-700">pull request</a>}
               </div>
-              <pre className="text-rose-400 bg-rose-950/40 px-2 py-1 rounded overflow-x-auto">
-                - {inspectedPr.diffRemoved}
-              </pre>
-              <pre className="text-emerald-400 bg-emerald-950/40 px-2 py-1 rounded mt-1 overflow-x-auto">
-                + {inspectedPr.diffAdded}
-              </pre>
-            </div>
 
-            <div className="flex items-center justify-between">
-              <div className="text-[11px] font-bold">
-                Verified by: <span className="font-mono uppercase">{inspectedPr.agentsInvolved.join(' → ')}</span>
-              </div>
-              {inspectedPr.status !== 'MERGED' && (
-                <button
-                  onClick={() => handleMergePr(inspectedPr.id)}
-                  className="manga-btn px-4 py-1.5 rounded-lg bg-emerald-300 text-[#1a1a1a] text-xs font-black flex items-center gap-1.5"
-                >
-                  <GitMerge className="w-4 h-4" /> Merge PR Now
-                </button>
+              <h3 className="font-black text-base mb-1">{inspectedPr.pr_title || inspectedPr.title}</h3>
+              <p className="text-xs opacity-70 mb-3 font-mono">{inspectedPr.why}</p>
+
+              {fix.cause && (
+                <div className="grid sm:grid-cols-2 gap-2 mb-3 text-xs">
+                  <div className="p-2.5 rounded-lg border-2 border-[#1a1a1a] bg-rose-50"><div className="font-black text-[10px] mb-1">CAUSE</div>{fix.cause}</div>
+                  <div className="p-2.5 rounded-lg border-2 border-[#1a1a1a] bg-emerald-50"><div className="font-black text-[10px] mb-1">FIX</div>{fix.fix}</div>
+                </div>
               )}
+
+              {proof.test_cmd && (
+                <div className="mb-3 p-2.5 rounded-lg border-2 border-[#1a1a1a] bg-amber-50 text-xs">
+                  <div className="font-black text-[10px] mb-1">PROOF · 証拠</div>
+                  <code className="font-mono text-[11px]">$ {proof.test_cmd}</code>
+                  <div className="mt-1 font-mono text-[11px]">
+                    <span className="text-rose-600 font-black">RED</span> without the fix (exit {proof.red_exit})
+                    {proof.green_exit !== undefined && <> · <span className="text-emerald-600 font-black">GREEN</span> with it (exit {proof.green_exit})</>}
+                  </div>
+                </div>
+              )}
+
+              {d.diff ? (
+                <div className="rounded-xl border-2 border-[#1a1a1a] bg-[#18181b] text-zinc-100 p-3 font-mono text-xs mb-4 shadow-[3px_3px_0px_#1a1a1a] max-h-[45vh] overflow-auto">
+                  <pre className="whitespace-pre">
+                    {d.diff.split('\n').map((l, i) => (
+                      <div
+                        key={i}
+                        className={
+                          l.startsWith('+++') || l.startsWith('---') || l.startsWith('diff ') || l.startsWith('index ')
+                            ? 'text-zinc-400'
+                            : l.startsWith('+')
+                            ? 'text-emerald-400 bg-emerald-950/40'
+                            : l.startsWith('-')
+                            ? 'text-rose-400 bg-rose-950/40'
+                            : l.startsWith('@@')
+                            ? 'text-sky-400'
+                            : ''
+                        }
+                      >
+                        {l || ' '}
+                      </div>
+                    ))}
+                  </pre>
+                </div>
+              ) : (
+                <p className="text-xs opacity-60 mb-4 whitespace-pre-wrap">{d.body ? String(d.body).slice(0, 1500) : 'No diff yet.'}</p>
+              )}
+
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-[11px] font-bold">
+                  Verified by: <span className="font-mono uppercase">{(inspectedPr.agents || []).join(' → ') || '—'}</span>
+                </div>
+                <div className="flex gap-2">
+                  {inspectedPr.state === 'approve' && (
+                    <>
+                      <button onClick={() => jobAction(inspectedPr.id, 'reject')} className="manga-btn px-3 py-1.5 rounded-lg bg-rose-200 text-xs font-black">Reject</button>
+                      <button onClick={() => jobAction(inspectedPr.id, 'approve')} className="manga-btn px-4 py-1.5 rounded-lg bg-emerald-300 text-[#1a1a1a] text-xs font-black flex items-center gap-1.5">
+                        <CheckCircle2 className="w-4 h-4" /> Approve & open PR
+                      </button>
+                    </>
+                  )}
+                  {['ready', 'vet'].includes(inspectedPr.state) && (
+                    <button onClick={() => jobAction(inspectedPr.id, 'reject')} className="manga-btn px-3 py-1.5 rounded-lg bg-rose-200 text-xs font-black">Cancel job</button>
+                  )}
+                  {['dropped', 'skipped', 'blocked'].includes(inspectedPr.state) && (
+                    <button onClick={() => jobAction(inspectedPr.id, 'retry')} className="manga-btn px-3 py-1.5 rounded-lg bg-amber-200 text-xs font-black">Try again</button>
+                  )}
+                  {inspectedPr.pr_state === 'OPEN' && inspectedPr.can_merge && (
+                    <button
+                      onClick={() => handleMergePr(inspectedPr.id)}
+                      className="manga-btn px-4 py-1.5 rounded-lg bg-emerald-300 text-[#1a1a1a] text-xs font-black flex items-center gap-1.5"
+                    >
+                      <GitMerge className="w-4 h-4" /> Merge PR Now
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* ==================== MODAL 2: REPOS / MACHINES QUICK INSPECTOR ==================== */}
       {activeHeaderModal && (
-        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="manga-panel rounded-2xl bg-[#fffdf9] text-[#1a1a1a] max-w-md w-full p-5 relative">
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4" onClick={() => setActiveHeaderModal(null)}>
+          <div className="manga-panel rounded-2xl bg-[#fffdf9] text-[#1a1a1a] max-w-lg w-full p-5 relative" onClick={(e) => e.stopPropagation()}>
             <button
               onClick={() => setActiveHeaderModal(null)}
               className="absolute top-3 right-3 w-7 h-7 rounded-full border-2 border-[#1a1a1a] bg-rose-300 flex items-center justify-center font-black"
@@ -1841,15 +1703,50 @@ export default function App() {
                     MY OFFICE REPOSITORIES
                   </span>
                 </div>
-                <div className="space-y-2.5 text-xs">
-                  <div className="p-3 rounded-xl border-2 border-[#1a1a1a] bg-white shadow-[2px_2px_0px_#1a1a1a]">
-                    <div className="flex items-center justify-between font-black">
-                      <span>Silvertree2010/ao-testbed</span>
-                      <span className="px-1.5 py-0.5 bg-emerald-200 border border-[#1a1a1a] rounded text-[10px]">ACTIVE</span>
+                <div className="space-y-2.5 text-xs max-h-[40vh] overflow-y-auto pr-1">
+                  {office.repos.length === 0 && <p className="opacity-70">No repositories yet. Add one below.</p>}
+                  {office.repos.map((r) => (
+                    <div key={r.full} className="p-3 rounded-xl border-2 border-[#1a1a1a] bg-white shadow-[2px_2px_0px_#1a1a1a]">
+                      <div className="flex items-center justify-between font-black gap-2">
+                        <span className="truncate">{r.full}</span>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <span className="px-1.5 py-0.5 bg-emerald-200 border border-[#1a1a1a] rounded text-[10px]">ACTIVE</span>
+                          <button
+                            onClick={() => confirm(`Remove ${r.full} from MY OFFICE?`) && api('/api/repo/delete', { full: r.full })}
+                            className="px-1.5 py-0.5 bg-rose-200 border border-[#1a1a1a] rounded text-[10px]"
+                          >
+                            REMOVE
+                          </button>
+                        </div>
+                      </div>
+                      <div className="font-mono text-[11px] opacity-75 mt-1">
+                        Test command: {r.test_cmd || 'none'} · Auto-PR: {r.auto ? 'Enabled' : 'asks you first'}
+                      </div>
                     </div>
-                    <div className="font-mono text-[11px] opacity-75 mt-1">
-                      Branch: main · Pytest suite: 42 passing · Auto-PR: Enabled
-                    </div>
+                  ))}
+                </div>
+                <div className="mt-4 p-3 rounded-xl border-2 border-dashed border-[#1a1a1a] space-y-2">
+                  <div className="font-black text-[11px]">+ ADD REPOSITORY</div>
+                  <input
+                    value={repoForm.full}
+                    onChange={(e) => setRepoForm({ ...repoForm, full: e.target.value })}
+                    placeholder="owner/repo"
+                    className="w-full px-3 py-1.5 rounded-lg border-2 border-[#1a1a1a] bg-white font-mono text-xs focus:outline-none focus:ring-2 focus:ring-pink-400"
+                  />
+                  <input
+                    value={repoForm.test_cmd}
+                    onChange={(e) => setRepoForm({ ...repoForm, test_cmd: e.target.value })}
+                    placeholder="full test command, e.g. pytest -q  or  cargo test"
+                    className="w-full px-3 py-1.5 rounded-lg border-2 border-[#1a1a1a] bg-white font-mono text-xs focus:outline-none focus:ring-2 focus:ring-pink-400"
+                  />
+                  <label className="flex items-center gap-2 text-[11px] font-bold">
+                    <input type="checkbox" checked={repoForm.auto} onChange={(e) => setRepoForm({ ...repoForm, auto: e.target.checked })} />
+                    Open PRs without asking me (Auto-PR)
+                  </label>
+                  <div className="flex justify-end">
+                    <button onClick={saveRepo} className="manga-btn px-3 py-1.5 rounded-lg bg-sky-200 text-xs font-black flex items-center gap-1">
+                      <Plus className="w-3.5 h-3.5" /> Add
+                    </button>
                   </div>
                 </div>
               </div>
@@ -1862,11 +1759,14 @@ export default function App() {
                 </div>
                 <div className="p-3 rounded-xl border-2 border-[#1a1a1a] bg-white shadow-[2px_2px_0px_#1a1a1a] text-xs space-y-2">
                   <div className="flex items-center justify-between font-black">
-                    <span>Node: ME (Local Workstation)</span>
-                    <span className="px-1.5 py-0.5 bg-emerald-300 border border-[#1a1a1a] rounded text-[10px]">6 BLADES READY</span>
+                    <span>Node: {office.machine.name || 'ME'} (this computer)</span>
+                    <span className="px-1.5 py-0.5 bg-emerald-300 border border-[#1a1a1a] rounded text-[10px]">{office.online ? 'ONLINE' : 'OFFLINE'}</span>
                   </div>
                   <div className="font-mono text-[11px] opacity-80">
-                    OS: Linux x86_64 · Sandbox: isolated venv · Token Throughput: 558k tok total
+                    OS: {office.machine.os} · CPUs: {office.machine.cpus} · Docker: {office.machine.docker ? `yes (${office.machine.docker})` : 'not running'}
+                  </div>
+                  <div className="font-mono text-[11px] opacity-80">
+                    Sandbox: none yet, agents run on this PC · Tokens today: {Object.values(office.agents).reduce((n: number, a: any) => n + (a.tokens || 0), 0)}k tok
                   </div>
                 </div>
               </div>
@@ -1877,8 +1777,8 @@ export default function App() {
 
       {/* ==================== MODAL 3: DISPATCH NEW CUSTOM ISSUE ==================== */}
       {showNewBugModal && (
-        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="manga-panel rounded-2xl bg-[#fffdf9] text-[#1a1a1a] max-w-md w-full p-5 relative">
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4" onClick={() => setShowNewBugModal(false)}>
+          <div className="manga-panel rounded-2xl bg-[#fffdf9] text-[#1a1a1a] max-w-md w-full p-5 relative" onClick={(e) => e.stopPropagation()}>
             <button
               onClick={() => setShowNewBugModal(false)}
               className="absolute top-3 right-3 w-7 h-7 rounded-full border-2 border-[#1a1a1a] bg-rose-300 flex items-center justify-center font-black"
@@ -1894,16 +1794,31 @@ export default function App() {
             </div>
 
             <p className="text-xs opacity-80 mb-3">
-              Enter a bug description below and watch your 10 chibi manga agents in <strong>MY OFFICE</strong> triage, reproduce, patch, test, and open a PR for it!
+              Give <strong>MY OFFICE</strong> a GitHub issue number or link, or describe a bug yourself. The agents will reproduce it, patch it, test it, and bring the fix to you for approval.
             </p>
 
-            <input
-              type="text"
-              value={customBugTitle}
-              onChange={(e) => setCustomBugTitle(e.target.value)}
-              placeholder="e.g., binary_search() overflows on high mid index"
-              className="w-full px-3 py-2 rounded-lg border-2 border-[#1a1a1a] bg-white font-mono text-xs mb-4 focus:outline-none focus:ring-2 focus:ring-pink-400"
-            />
+            {office.repos.length === 0 ? (
+              <p className="text-xs font-bold text-rose-600 mb-4">Add a repository first (Repos button).</p>
+            ) : (
+              <>
+                <select
+                  value={newBugRepo || office.repos[0].full}
+                  onChange={(e) => setNewBugRepo(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg border-2 border-[#1a1a1a] bg-white font-mono text-xs mb-2 focus:outline-none"
+                >
+                  {office.repos.map((r) => (
+                    <option key={r.full} value={r.full}>{r.full}</option>
+                  ))}
+                </select>
+                <textarea
+                  value={customBugTitle}
+                  onChange={(e) => setCustomBugTitle(e.target.value)}
+                  rows={3}
+                  placeholder={'#12  or  https://github.com/owner/repo/issues/12\nor: binary_search() overflows on high mid index'}
+                  className="w-full px-3 py-2 rounded-lg border-2 border-[#1a1a1a] bg-white font-mono text-xs mb-4 focus:outline-none focus:ring-2 focus:ring-pink-400"
+                />
+              </>
+            )}
 
             <div className="flex justify-end gap-2">
               <button
@@ -1913,11 +1828,13 @@ export default function App() {
                 Cancel
               </button>
               <button
-                onClick={() => {
-                  const title = customBugTitle.trim() || 'custom_hook() fails on empty array input';
-                  setCustomBugTitle('');
-                  setShowNewBugModal(false);
-                  startBugHuntSimulation(title);
+                disabled={office.repos.length === 0}
+                onClick={async () => {
+                  const r = await dispatchNewIssue();
+                  if (r.ok) {
+                    setCustomBugTitle('');
+                    setShowNewBugModal(false);
+                  }
                 }}
                 className="manga-btn px-4 py-1.5 rounded-lg bg-pink-400 text-[#1a1a1a] text-xs font-black flex items-center gap-1"
               >
