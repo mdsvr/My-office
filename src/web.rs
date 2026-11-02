@@ -1,7 +1,7 @@
 use crate::db::{Job, Repo};
 use crate::{llm, pipeline, App, AGENTS};
 use axum::extract::{Query, Request, State};
-use axum::http::{header, Method, StatusCode, Uri};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -40,6 +40,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/provider", post(save_provider))
         .route("/api/machine", post(save_machine))
         .route("/api/machine/delete", post(delete_machine))
+        .route("/api/token", post(api_token))
+        .route("/v1/report", post(v1_report))
+        .route("/v1/hook/sentry", post(v1_sentry))
         .route("/api/agent/test", post(test_agent))
         .route("/api/office/pause", post(pause))
         .fallback(get(static_file))
@@ -50,6 +53,11 @@ pub fn router(app: Arc<App>) -> Router {
 /// Only this computer's browser may talk to the office: the Host must be localhost
 /// (stops DNS rebinding) and POSTs need a custom header (stops other websites' forms).
 async fn guard(State(app): S, req: Request, next: Next) -> Response {
+    // The report API and webhooks may come from other machines (through a tunnel); they check
+    // the API token themselves.
+    if req.uri().path().starts_with("/v1/") {
+        return next.run(req).await;
+    }
     let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
     let host_ok = host == format!("127.0.0.1:{}", app.port) || host == format!("localhost:{}", app.port);
     if !host_ok || (req.method() == Method::POST && !req.headers().contains_key("x-myoffice")) {
@@ -190,7 +198,7 @@ async fn save_repo(State(app): S, Json(b): Json<Value>) -> Json<Value> {
         return err("use the form owner/repo");
     }
     let test_cmd = b["test_cmd"].as_str().unwrap_or("").trim().to_string();
-    app.db.save_repo(&Repo { full: full.clone(), test_cmd, auto: b["auto"].as_bool().unwrap_or(false), enabled: true, hunt: b["hunt"].as_bool().unwrap_or(false) });
+    app.db.save_repo(&Repo { full: full.clone(), test_cmd, auto: b["auto"].as_bool().unwrap_or(false), enabled: true, hunt: b["hunt"].as_bool().unwrap_or(false), ci: b["ci"].as_bool().unwrap_or(true) });
     app.log("scout", None, &format!("added {full}"));
     app.scan.notify_one();
     ok()
@@ -380,4 +388,55 @@ mod tests {
         assert!(!super::valid_host("ssh://me@box; rm -rf /"));
         assert!(!super::valid_host("tcp://box:2375"));
     }
+}
+
+// ---------------------------------------------------------------- outside bug sources
+
+/// Constant-time comparison with the stored API token.
+fn token_ok(app: &App, given: &str) -> bool {
+    let Some(t) = app.db.get("api_token").filter(|t| !t.is_empty()) else { return false };
+    t.len() == given.len() && t.bytes().zip(given.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+fn bearer(h: &HeaderMap) -> String {
+    h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("").trim().to_string()
+}
+
+fn v1_answer(r: Result<i64, String>) -> Response {
+    match r {
+        Ok(id) => (StatusCode::OK, Json(json!({"ok": true, "id": id}))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+    }
+}
+
+/// POST /v1/report  {"repo": "owner/repo", "title": "...", "body": "...", "url": "..."}
+async fn v1_report(State(app): S, h: HeaderMap, Json(b): Json<Value>) -> Response {
+    if !token_ok(&app, &bearer(&h)) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "missing or wrong API token"}))).into_response();
+    }
+    let s = |k: &str| b[k].as_str().unwrap_or("").to_string();
+    v1_answer(crate::sources::report(&app, &s("repo"), "report", &s("title"), &s("body"), &s("url")))
+}
+
+/// POST /v1/hook/sentry?repo=owner/repo&token=...  (Sentry alert webhook)
+async fn v1_sentry(State(app): S, h: HeaderMap, Query(q): Query<HashMap<String, String>>, Json(b): Json<Value>) -> Response {
+    let given = q.get("token").cloned().unwrap_or_else(|| bearer(&h));
+    if !token_ok(&app, &given) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "missing or wrong API token"}))).into_response();
+    }
+    let (title, body, url) = crate::sources::sentry(&b);
+    v1_answer(crate::sources::report(&app, q.get("repo").map(String::as_str).unwrap_or(""), "sentry", &title, &body, &url))
+}
+
+/// Create a new API token (shown once) or revoke it.
+async fn api_token(State(app): S, Json(b): Json<Value>) -> Json<Value> {
+    if b["op"] == "revoke" {
+        app.db.set("api_token", "");
+        app.log("watcher", None, "API token revoked");
+        return ok();
+    }
+    let t = crate::sources::new_token();
+    app.db.set("api_token", &t);
+    app.log("watcher", None, "new API token created (old one stops working)");
+    Json(json!({"ok": true, "token": t}))
 }

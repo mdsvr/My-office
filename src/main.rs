@@ -6,6 +6,7 @@ mod pipeline;
 mod prompts;
 mod sandbox;
 mod sh;
+mod sources;
 mod tools;
 mod watcher;
 mod web;

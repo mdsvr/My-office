@@ -75,6 +75,11 @@ async fn scout(app: &App) -> Result<(), String> {
     let skip = Regex::new(SKIP_LABELS).unwrap();
     for r in app.db.repos().into_iter().filter(|r| r.enabled) {
         app.set("scout", "WORKING", None, Some(&format!("scanning {}", r.full)));
+        if r.ci {
+            if let Err(e) = crate::sources::ci_failures(app, &r).await {
+                app.log("scout", None, &format!("{}: couldn't check CI: {}", r.full, sh::head(&e, 200)));
+            }
+        }
         let raw = sh::ok("gh", &["issue", "list", "-R", &r.full, "--state", "open", "--limit", "50", "--json", "number,title,body,labels,assignees,url"], &app.data, 120).await?;
         let issues: Vec<Value> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         let fresh: Vec<&Value> = issues
