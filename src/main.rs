@@ -109,7 +109,8 @@ async fn main() -> anyhow::Result<()> {
     let port: u16 = std::env::var("MYOFFICE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(47400);
     let data = std::env::var_os("MYOFFICE_DATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("data"));
     std::fs::create_dir_all(data.join("work"))?;
-    let data = std::fs::canonicalize(&data)?;
+    // Not canonicalize(): on Windows it adds a \\?\ prefix that git and gh don't handle well.
+    let data = if data.is_absolute() { data } else { std::env::current_dir()?.join(data) };
     let db = db::Db::open(&data.join("office.db"))?;
     let (tx, _) = broadcast::channel(1024);
     let live = AGENTS

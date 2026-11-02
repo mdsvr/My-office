@@ -177,7 +177,7 @@ async fn save_repo(State(app): S, Json(b): Json<Value>) -> Json<Value> {
         return err("use the form owner/repo");
     }
     let test_cmd = b["test_cmd"].as_str().unwrap_or("").trim().to_string();
-    app.db.save_repo(&Repo { full: full.clone(), test_cmd, auto: b["auto"].as_bool().unwrap_or(false), enabled: true });
+    app.db.save_repo(&Repo { full: full.clone(), test_cmd, auto: b["auto"].as_bool().unwrap_or(false), enabled: true, hunt: b["hunt"].as_bool().unwrap_or(false) });
     app.log("scout", None, &format!("added {full}"));
     app.scan.notify_one();
     ok()

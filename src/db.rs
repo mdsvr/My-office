@@ -58,6 +58,8 @@ pub struct Repo {
     pub test_cmd: String,
     pub auto: bool,
     pub enabled: bool,
+    /// Let Hunter read the code and look for bugs nobody reported.
+    pub hunt: bool,
 }
 
 /// One bug moving through the office. `state`:
@@ -108,6 +110,7 @@ impl Db {
     pub fn open(path: &Path) -> anyhow::Result<Db> {
         let c = Connection::open(path)?;
         c.execute_batch(SCHEMA)?;
+        let _ = c.execute("alter table repos add column hunt integer not null default 0", []); // added after v0.1
         // Work cut off by a restart starts over; a cut-off submit waits for approval again.
         c.execute("update jobs set state='ready', why='restarted' where state in ('repro','fix','ci','review')", [])?;
         c.execute("update jobs set state='approve', why='restarted while submitting, approve again' where state='submit'", [])?;
@@ -122,9 +125,9 @@ impl Db {
 
     pub fn repos(&self) -> Vec<Repo> {
         let c = self.c();
-        let mut s = c.prepare("select full, test_cmd, auto, enabled from repos order by full").unwrap();
+        let mut s = c.prepare("select full, test_cmd, auto, enabled, hunt from repos order by full").unwrap();
         let v = s
-            .query_map([], |r| Ok(Repo { full: r.get(0)?, test_cmd: r.get(1)?, auto: r.get(2)?, enabled: r.get(3)? }))
+            .query_map([], |r| Ok(Repo { full: r.get(0)?, test_cmd: r.get(1)?, auto: r.get(2)?, enabled: r.get(3)?, hunt: r.get(4)? }))
             .unwrap()
             .filter_map(Result::ok)
             .collect();
@@ -138,9 +141,9 @@ impl Db {
     pub fn save_repo(&self, r: &Repo) {
         self.c()
             .execute(
-                "insert into repos(full, test_cmd, auto, enabled) values(?1, ?2, ?3, ?4)
-                 on conflict(full) do update set test_cmd=excluded.test_cmd, auto=excluded.auto, enabled=excluded.enabled",
-                params![r.full, r.test_cmd, r.auto, r.enabled],
+                "insert into repos(full, test_cmd, auto, enabled, hunt) values(?1, ?2, ?3, ?4, ?5)
+                 on conflict(full) do update set test_cmd=excluded.test_cmd, auto=excluded.auto, enabled=excluded.enabled, hunt=excluded.hunt",
+                params![r.full, r.test_cmd, r.auto, r.enabled, r.hunt],
             )
             .unwrap();
     }

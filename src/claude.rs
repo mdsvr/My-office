@@ -11,8 +11,8 @@ pub struct Ask<'a> {
     pub system: &'static str,
     pub prompt: String,
     pub cwd: &'a Path,
-    /// true: may read/edit files and run commands in `cwd`. false: text answer only.
-    pub tools: bool,
+    /// Tools it may use in `cwd`: EDIT, READ, or "" for a text answer only.
+    pub tools: &'static str,
     /// Continue an earlier conversation (Repro and Fixer keep their context between rounds).
     pub resume: Option<String>,
     pub max_turns: u32,
@@ -24,7 +24,10 @@ pub struct Reply {
     pub session: String,
 }
 
-const TOOLS: &str = "Read,Edit,Write,Glob,Grep,Bash";
+/// Read, change and run things in the repo (Repro, Fixer).
+pub const EDIT: &str = "Read,Edit,Write,Glob,Grep,Bash";
+/// Look only (Hunter).
+pub const READ: &str = "Read,Glob,Grep";
 // ponytail: Claude Code's permission rules are the only fence here, and Bash runs on your own PC.
 // Phase 5 of PLAN.md moves this into Docker; until then only add repos you trust.
 const DENY: &[&str] = &["Bash(git push:*)", "Bash(git remote:*)", "Bash(git config:*)", "Bash(gh:*)", "Bash(curl:*)", "Bash(wget:*)", "Bash(ssh:*)"];
@@ -51,11 +54,10 @@ pub async fn ask(app: &App, a: Ask<'_>) -> Result<Reply, String> {
     // --setting-sources= : load no settings files, so neither your hooks/plugins nor a cloned
     // repo's .claude/settings.json can run anything. Your login still works.
     let mut args: Vec<&str> = vec!["-p", "--setting-sources=", "--output-format", "stream-json", "--verbose", "--model", &model, "--max-turns", &turns, "--append-system-prompt", a.system];
-    if a.tools {
-        args.extend(["--tools", TOOLS, "--allowedTools", TOOLS, "--disallowedTools"]);
+    args.extend(["--tools", a.tools]);
+    if !a.tools.is_empty() {
+        args.extend(["--allowedTools", a.tools, "--disallowedTools"]);
         args.extend(DENY.iter().copied());
-    } else {
-        args.extend(["--tools", ""]);
     }
     if let Some(s) = &a.resume {
         args.extend(["--resume", s.as_str()]);

@@ -21,13 +21,13 @@ fn workdir(app: &App, repo: &str) -> PathBuf {
     app.data.join("work").join(repo.replace('/', "__"))
 }
 
-/// "ao-testbed#6", or "ao-testbed (report 12)" for a bug you described.
+/// "ao-testbed#6", "ao-testbed (report 12)" for a bug you described, "ao-testbed (hunt 13)" for Hunter's.
 pub fn label(j: &Job) -> String {
     let name = j.repo.rsplit('/').next().unwrap_or(&j.repo);
-    if j.issue > 0 {
-        format!("{name}#{}", j.issue)
-    } else {
-        format!("{name} (report {})", j.id)
+    match (j.issue, j.kind.as_str()) {
+        (n, _) if n > 0 => format!("{name}#{n}"),
+        (_, "hunt") => format!("{name} (hunt {})", j.id),
+        _ => format!("{name} (report {})", j.id),
     }
 }
 
@@ -54,6 +54,10 @@ pub async fn scout_loop(app: Arc<App>) {
             app.log("scout", None, &format!("error: {e}"));
         }
         app.set("scout", "IDLE", None, None);
+        if let Err(e) = hunt_all(&app).await {
+            app.log("hunter", None, &format!("error: {e}"));
+        }
+        app.set("hunter", hunter_status(&app), None, None);
         if let Err(e) = vet_all(&app).await {
             app.log("vet", None, &format!("error: {e}"));
         }
@@ -92,7 +96,7 @@ async fn scout(app: &App) -> Result<(), String> {
                 .map(|i| format!("<untrusted-issue number=\"{}\">\n{}\n\n{}\n</untrusted-issue>", i["number"], i["title"].as_str().unwrap_or(""), sh::head(i["body"].as_str().unwrap_or(""), 3000)))
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            let reply = claude::ask(app, Ask { agent: "scout", job: None, system: prompts::SCOUT, prompt, cwd: &app.data, tools: false, resume: None, max_turns: 1, secs: 300 }).await?;
+            let reply = claude::ask(app, Ask { agent: "scout", job: None, system: prompts::SCOUT, prompt, cwd: &app.data, tools: "", resume: None, max_turns: 1, secs: 300 }).await?;
             for i in chunk {
                 let n = i["number"].as_i64().unwrap_or(0);
                 let v = &reply.json[n.to_string()];
@@ -115,7 +119,7 @@ async fn vet_all(app: &App) -> Result<(), String> {
         let issue = untrusted(&j);
 
         app.set("guard", "WORKING", Some(id), Some(&format!("checking {tag}")));
-        let g = claude::ask(app, Ask { agent: "guard", job: Some(id), system: prompts::GUARD, prompt: issue.clone(), cwd: &app.data, tools: false, resume: None, max_turns: 1, secs: 300 }).await?;
+        let g = claude::ask(app, Ask { agent: "guard", job: Some(id), system: prompts::GUARD, prompt: issue.clone(), cwd: &app.data, tools: "", resume: None, max_turns: 1, secs: 300 }).await?;
         app.set("guard", "IDLE", None, Some("—"));
         involve(app, id, "guard");
         if g.json["injection"].as_bool() != Some(false) {
@@ -134,7 +138,7 @@ async fn vet_all(app: &App) -> Result<(), String> {
         app.set("vet", "WORKING", Some(id), Some(&format!("vetting {tag}")));
         let prs = sh::ok("gh", &["pr", "list", "-R", &j.repo, "--state", "open", "--limit", "50", "--json", "number,title"], &app.data, 60).await.unwrap_or_default();
         let prompt = format!("Repository {}.\n\n{issue}\n\nOpen pull requests (number, title):\n{}", j.repo, sh::head(&prs, 6000));
-        let v = claude::ask(app, Ask { agent: "vet", job: Some(id), system: prompts::VET, prompt, cwd: &app.data, tools: false, resume: None, max_turns: 1, secs: 300 }).await?;
+        let v = claude::ask(app, Ask { agent: "vet", job: Some(id), system: prompts::VET, prompt, cwd: &app.data, tools: "", resume: None, max_turns: 1, secs: 300 }).await?;
         app.set("vet", "IDLE", None, Some("—"));
         involve(app, id, "vet");
         let why = v.json["why"].as_str().unwrap_or("no verdict").to_string();
@@ -145,6 +149,47 @@ async fn vet_all(app: &App) -> Result<(), String> {
         } else {
             app.db.set_state(id, "skipped", &format!("Vet: {why}"));
             app.log("vet", Some(id), &format!("{tag} skipped: {why}"));
+        }
+    }
+    Ok(())
+}
+
+// ================================================================ Hunter
+
+fn hunter_status(app: &App) -> &'static str {
+    if app.db.repos().iter().any(|r| r.enabled && r.hunt) { "IDLE" } else { "OFF" }
+}
+
+/// Hunter reads the code (read-only) of repos where you turned it on, at most once a day each.
+/// What it finds goes through Guard and Vet like any issue.
+async fn hunt_all(app: &App) -> Result<(), String> {
+    for r in app.db.repos().into_iter().filter(|r| r.enabled && r.hunt) {
+        let key = format!("hunt:{}", r.full);
+        if crate::db::now() - app.db.get(&key).and_then(|t| t.parse::<i64>().ok()).unwrap_or(0) < 86_400 {
+            continue;
+        }
+        app.wait_unpaused().await;
+        app.set("hunter", "WORKING", None, Some(&format!("hunting in {}", r.full)));
+        // Its own clone, so it never touches the branch Repro/Fixer are working on.
+        let dir = app.data.join("hunt").join(r.full.replace('/', "__"));
+        let default = sync(app, &r.full, &dir, "hunter", None).await?;
+        sh::ok("git", &["checkout", "-q", "-f", "--detach", &format!("origin/{default}")], &dir, 120).await?;
+        let known: Vec<String> = app.db.jobs(200).into_iter().filter(|j| j.repo == r.full).map(|j| j.title).collect();
+        let prompt = format!("Repository: {}\n\nBugs already known (don't report these again):\n{}", r.full, sh::head(&known.join("\n"), 4000));
+        let reply = claude::ask(app, Ask { agent: "hunter", job: None, system: prompts::HUNTER, prompt, cwd: &dir, tools: claude::READ, resume: None, max_turns: 60, secs: 1800 }).await?;
+        app.db.set(&key, &crate::db::now().to_string());
+        let bugs = reply.json["bugs"].as_array().cloned().unwrap_or_default();
+        for b in bugs.iter().take(3) {
+            let title = b["title"].as_str().unwrap_or("").trim();
+            if title.is_empty() || known.iter().any(|k| k == title) {
+                continue;
+            }
+            let body = format!("{}\n\nWhere: {}", b["body"].as_str().unwrap_or(""), b["where"].as_str().unwrap_or("?"));
+            let id = app.db.add_job(&r.full, 0, "hunt", title, "", "vet", "found by Hunter", &json!({"body": body, "agents": ["hunter"]}));
+            app.log("hunter", Some(id), &format!("found: {title}"));
+        }
+        if bugs.is_empty() {
+            app.log("hunter", None, &format!("{}: no convincing bugs found today", r.full));
         }
     }
     Ok(())
@@ -194,15 +239,21 @@ pub async fn run_loop(app: Arc<App>) {
     }
 }
 
-/// Fresh branch from the latest default branch. Returns (base commit, branch, default branch).
-async fn prepare(app: &App, job: &Job, dir: &Path) -> Result<(String, String, String), String> {
-    let default = sh::ok("gh", &["repo", "view", &job.repo, "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"], &app.data, 60).await?.trim().to_string();
+/// Clone (first time) or fetch the repo into `dir`. Returns the default branch name.
+async fn sync(app: &App, repo: &str, dir: &Path, agent: &str, job: Option<i64>) -> Result<String, String> {
+    let default = sh::ok("gh", &["repo", "view", repo, "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"], &app.data, 60).await?.trim().to_string();
     if !dir.join(".git").exists() {
-        app.log("repro", Some(job.id), &format!("cloning {}", job.repo));
-        sh::ok("gh", &["repo", "clone", &job.repo, &dir.to_string_lossy()], &app.data, 1800).await?;
+        app.log(agent, job, &format!("cloning {repo}"));
+        sh::ok("gh", &["repo", "clone", repo, &dir.to_string_lossy()], &app.data, 1800).await?;
     }
     sh::ok("git", &["fetch", "-q", "origin"], dir, 600).await?;
-    let branch = if job.issue > 0 { format!("myoffice/issue-{}", job.issue) } else { format!("myoffice/report-{}", job.id) };
+    Ok(default)
+}
+
+/// Fresh branch from the latest default branch. Returns (base commit, branch, default branch).
+async fn prepare(app: &App, job: &Job, dir: &Path) -> Result<(String, String, String), String> {
+    let default = sync(app, &job.repo, dir, "repro", Some(job.id)).await?;
+    let branch = if job.issue > 0 { format!("myoffice/issue-{}", job.issue) } else { format!("myoffice/{}-{}", job.kind, job.id) };
     sh::ok("git", &["checkout", "-q", "-f", "-B", &branch, &format!("origin/{default}")], dir, 120).await?;
     // ponytail: -fd keeps ignored build caches (target/, node_modules/) so rebuilds stay fast.
     sh::ok("git", &["clean", "-fdq"], dir, 120).await?;
@@ -266,7 +317,7 @@ async fn repro(app: &App, id: i64, tag: &str, dir: &Path, base: &str, context: &
     for attempt in 1..=REPRO_TRIES {
         app.db.set_state(id, "repro", &format!("writing a failing test (try {attempt})"));
         app.set("repro", "WORKING", Some(id), Some(&format!("sketching test for {tag}")));
-        let reply = claude::ask(app, Ask { agent: "repro", job: Some(id), system: prompts::REPRO, prompt: prompt.clone(), cwd: dir, tools: true, resume: session.clone(), max_turns: 80, secs: 2400 }).await?;
+        let reply = claude::ask(app, Ask { agent: "repro", job: Some(id), system: prompts::REPRO, prompt: prompt.clone(), cwd: dir, tools: claude::EDIT, resume: session.clone(), max_turns: 80, secs: 2400 }).await?;
         if !reply.session.is_empty() {
             session = Some(reply.session);
         }
@@ -333,7 +384,7 @@ async fn fix_rounds(app: &App, job: &Job, repo: &Repo, dir: &Path, base: &str, c
         app.wait_unpaused().await;
         app.db.set_state(id, "fix", &format!("round {round} of {FIX_ROUNDS}"));
         app.set("fixer", "WORKING", Some(id), Some(&format!("patching {tag}...")));
-        let reply = claude::ask(app, Ask { agent: "fixer", job: Some(id), system: prompts::FIXER, prompt: prompt.clone(), cwd: dir, tools: true, resume: session.clone(), max_turns: 100, secs: 3600 }).await?;
+        let reply = claude::ask(app, Ask { agent: "fixer", job: Some(id), system: prompts::FIXER, prompt: prompt.clone(), cwd: dir, tools: claude::EDIT, resume: session.clone(), max_turns: 100, secs: 3600 }).await?;
         if !reply.session.is_empty() {
             session = Some(reply.session);
         }
@@ -410,7 +461,7 @@ async fn check_fix(app: &App, job: &Job, repo: &Repo, dir: &Path, base: &str, pr
         f["fix"].as_str().unwrap_or(""),
         sh::head(&diff, 100_000)
     );
-    let r = claude::ask(app, Ask { agent: "reviewer", job: Some(id), system: prompts::REVIEWER, prompt, cwd: dir, tools: false, resume: None, max_turns: 1, secs: 900 }).await?;
+    let r = claude::ask(app, Ask { agent: "reviewer", job: Some(id), system: prompts::REVIEWER, prompt, cwd: dir, tools: "", resume: None, max_turns: 1, secs: 900 }).await?;
     involve(app, id, "reviewer");
     match r.json["ok"].as_bool() {
         Some(true) => {
@@ -483,7 +534,11 @@ async fn ready(app: &App, id: i64, repo: &Repo, dir: &Path, base: &str, f: Value
 fn pr_body(job: &Job, f: &Value, auto: bool) -> String {
     let p = &job.data["proof"];
     let tests = p["tests"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).map(|t| format!("`{t}`")).collect::<Vec<_>>().join(", ");
-    let reference = if job.issue > 0 { format!("Fixes #{}", job.issue) } else { "Bug found and reported directly (no GitHub issue).".into() };
+    let reference = match (job.issue, job.kind.as_str()) {
+        (n, _) if n > 0 => format!("Fixes #{n}"),
+        (_, "hunt") => "Bug found while reading the code (no GitHub issue).".into(),
+        _ => "Bug found and reported directly (no GitHub issue).".into(),
+    };
     format!(
         "{reference}\n\n## Cause\n{}\n\n## Fix\n{}\n\n## Proof\nRegression test {tests}, run with `{}`:\n- fails on the test commit, without the fix\n- passes on the fix commit\n\n---\n🤖 Generated with AI (Claude Code) by MyOffice{}.",
         f["cause"].as_str().unwrap_or(""),
@@ -605,14 +660,14 @@ pub async fn test_agent(app: &App, agent: &str) {
     let Some((id, _)) = crate::AGENTS.iter().find(|(a, _)| *a == agent) else { return };
     app.set(id, "WORKING", None, None);
     let t = Instant::now();
-    let r = claude::ask(app, Ask { agent: id, job: None, system: "Answer only with JSON.", prompt: r#"Reply with exactly {"ok": true}"#.into(), cwd: &app.data, tools: false, resume: None, max_turns: 1, secs: 120 }).await;
+    let r = claude::ask(app, Ask { agent: id, job: None, system: "Answer only with JSON.", prompt: r#"Reply with exactly {"ok": true}"#.into(), cwd: &app.data, tools: "", resume: None, max_turns: 1, secs: 120 }).await;
     let msg = match r {
         Ok(r) if r.json["ok"] == true => format!("test ok: {} answered in {:.1}s", app.model(id), t.elapsed().as_secs_f32()),
         Ok(_) => "test: answered, but not with the expected JSON".into(),
         Err(e) => format!("test failed: {e}"),
     };
     app.log(id, None, &msg);
-    app.set(id, if *id == "hunter" { "OFF" } else { "IDLE" }, None, None);
+    app.set(id, if *id == "hunter" { hunter_status(app) } else { "IDLE" }, None, None);
 }
 
 #[cfg(test)]

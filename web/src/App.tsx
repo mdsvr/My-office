@@ -621,7 +621,7 @@ export default function App() {
   const [showNewBugModal, setShowNewBugModal] = useState(false);
   const [customBugTitle, setCustomBugTitle] = useState('');
   const [newBugRepo, setNewBugRepo] = useState('');
-  const [repoForm, setRepoForm] = useState({ full: '', test_cmd: '', auto: false });
+  const [repoForm, setRepoForm] = useState({ full: '', test_cmd: '', auto: false, hunt: false });
 
   useEffect(() => {
     const tick = () => setClockStr(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
@@ -708,7 +708,7 @@ export default function App() {
 
   const saveRepo = async () => {
     const r = await api('/api/repo', repoForm);
-    if (r.ok) setRepoForm({ full: '', test_cmd: '', auto: false });
+    if (r.ok) setRepoForm({ full: '', test_cmd: '', auto: false, hunt: false });
   };
 
   // Theme palette classes
@@ -1720,7 +1720,7 @@ export default function App() {
                         </div>
                       </div>
                       <div className="font-mono text-[11px] opacity-75 mt-1">
-                        Test command: {r.test_cmd || 'none'} · Auto-PR: {r.auto ? 'Enabled' : 'asks you first'}
+                        Test command: {r.test_cmd || 'none'} · Auto-PR: {r.auto ? 'Enabled' : 'asks you first'} · Hunter: {r.hunt ? 'on' : 'off'}
                       </div>
                     </div>
                   ))}
@@ -1742,6 +1742,10 @@ export default function App() {
                   <label className="flex items-center gap-2 text-[11px] font-bold">
                     <input type="checkbox" checked={repoForm.auto} onChange={(e) => setRepoForm({ ...repoForm, auto: e.target.checked })} />
                     Open PRs without asking me (Auto-PR)
+                  </label>
+                  <label className="flex items-center gap-2 text-[11px] font-bold">
+                    <input type="checkbox" checked={repoForm.hunt} onChange={(e) => setRepoForm({ ...repoForm, hunt: e.target.checked })} />
+                    Let HUNTER read the code and look for unreported bugs (once a day)
                   </label>
                   <div className="flex justify-end">
                     <button onClick={saveRepo} className="manga-btn px-3 py-1.5 rounded-lg bg-sky-200 text-xs font-black flex items-center gap-1">
