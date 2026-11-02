@@ -8,10 +8,11 @@ mod sandbox;
 mod sh;
 mod tools;
 mod web;
+mod workers;
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,8 +54,14 @@ pub struct App {
     pub wake: Notify,
     /// Wakes the scout (repo added, issue added, "Run Full Pipeline").
     pub scan: Notify,
-    /// Where repo work runs; started on first use (building the Docker image can take minutes).
+    /// This PC's sandbox; started on first use (building the Docker image can take minutes).
     pub sb: OnceCell<sandbox::Sandbox>,
+    /// Sandboxes on other machines, opened on first use.
+    pub remote: tokio::sync::Mutex<HashMap<String, sandbox::Sandbox>>,
+    /// "ok" or the last error per machine, for the Machines popup.
+    pub machine_status: Mutex<HashMap<String, String>>,
+    /// Lanes that are running ("machine#n").
+    pub lanes_up: Mutex<HashSet<String>>,
 }
 
 impl App {
@@ -74,7 +81,7 @@ impl App {
             "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
             "sandbox": "starting...",
         });
-        Ok(App { db, data, port, tx, live: Mutex::new(live), machine: Mutex::new(machine), wake: Notify::new(), scan: Notify::new(), sb: OnceCell::new() })
+        Ok(App { db, data, port, tx, live: Mutex::new(live), machine: Mutex::new(machine), wake: Notify::new(), scan: Notify::new(), sb: OnceCell::new(), remote: Default::default(), machine_status: Default::default(), lanes_up: Default::default() })
     }
 
     pub async fn sandbox(&self) -> &sandbox::Sandbox {
@@ -87,6 +94,35 @@ impl App {
                 sb
             })
             .await
+    }
+
+    /// The sandbox of a machine: this PC ("me") or another machine's Docker over SSH.
+    pub async fn machine_sandbox(&self, id: &str) -> Result<sandbox::Sandbox, String> {
+        if id == "me" {
+            let sb = self.sandbox().await.clone();
+            self.machine_status.lock().unwrap().insert(id.into(), "ok".into());
+            return Ok(sb);
+        }
+        let mut remote = self.remote.lock().await;
+        if let Some(sb) = remote.get(id) {
+            return Ok(sb.clone());
+        }
+        let m = self.db.machines().into_iter().find(|m| m.id == id).ok_or("machine removed")?;
+        match sandbox::Sandbox::remote(&self.data, &m.host).await {
+            Ok(sb) => {
+                self.machine_status.lock().unwrap().insert(id.into(), "ok".into());
+                self.log("watcher", None, &format!("machine {} ready ({})", m.name, m.host));
+                remote.insert(id.into(), sb.clone());
+                Ok(sb)
+            }
+            Err(e) => {
+                let first = self.machine_status.lock().unwrap().insert(id.into(), e.clone()).as_deref() != Some(e.as_str());
+                if first {
+                    self.log("watcher", None, &format!("machine {} not usable: {}", m.name, sh::head(&e, 200)));
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Something an agent says: saved, shown in the LOG panel and in its speech bubble.
@@ -190,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
         a.changed();
     });
     tokio::spawn(pipeline::scout_loop(app.clone()));
-    tokio::spawn(pipeline::run_loop(app.clone()));
+    tokio::spawn(workers::supervise(app.clone()));
     tokio::spawn(pipeline::watch_loop(app.clone()));
 
     // ponytail: localhost only, no login. Add a login link before exposing it to a network.

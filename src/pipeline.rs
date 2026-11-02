@@ -4,8 +4,9 @@
 
 use crate::llm::{self, Ask};
 use crate::tools::Toolbox;
+use crate::workers::Lane;
 use crate::db::{Job, Repo};
-use crate::sandbox::{space, Mode, Sandbox};
+use crate::sandbox::{space, Sandbox};
 use crate::sh::q;
 use crate::{prompts, sh, App};
 use regex::Regex;
@@ -258,36 +259,26 @@ pub async fn add_issue(app: &App, repo: &str, n: i64) -> Result<(), String> {
 
 // ================================================================ Runner
 
-pub async fn run_loop(app: Arc<App>) {
-    loop {
-        app.wait_unpaused().await;
-        let Some(job) = app.db.next_job() else {
-            tokio::select! {
-                _ = app.wake.notified() => {}
-                _ = tokio::time::sleep(Duration::from_secs(60)) => {}
-            }
-            continue;
-        };
-        let id = job.id;
-        if job.state == "approved" {
-            if let Err(e) = submit(&app, &job).await {
-                // A failed push shouldn't throw the verified fix away.
-                app.db.set_state(id, "approve", &format!("submit failed: {}", sh::head(&e, 300)));
-                app.log("submit", Some(id), &format!("submit failed: {e}"));
-            }
-        } else if let Err(e) = work(&app, &job).await {
-            app.db.set_state(id, "dropped", &sh::head(&e, 300));
-            app.log("fixer", Some(id), &format!("{} dropped: {e}", label(&job)));
+/// Runs one claimed job on a lane: build and verify a fix, or submit an approved one.
+pub async fn run_job(app: &App, lane: &Lane, job: Job) {
+    let id = job.id;
+    if job.state == "approved" {
+        if let Err(e) = submit(app, lane, &job).await {
+            // A failed push shouldn't throw the verified fix away.
+            app.db.set_state(id, "approve", &format!("submit failed: {}", sh::head(&e, 300)));
+            app.log("submit", Some(id), &format!("submit failed: {e}"));
         }
-        for a in ["repro", "fixer", "ci", "reviewer", "submit"] {
-            app.set(a, "IDLE", None, None);
-        }
+    } else if let Err(e) = work(app, lane, &job).await {
+        app.db.set_state(id, "dropped", &sh::head(&e, 300));
+        app.log("fixer", Some(id), &format!("{} dropped: {e}", label(&job)));
+    }
+    for a in ["repro", "fixer", "ci", "reviewer", "submit"] {
+        app.set(a, "IDLE", None, None);
     }
 }
 
 /// Fresh branch from the latest default branch, in the sandbox. Returns (base, branch, default).
-async fn prepare(app: &App, job: &Job, sp: &str) -> Result<(String, String, String), String> {
-    let sb = app.sandbox().await;
+async fn prepare(app: &App, sb: &Sandbox, job: &Job, sp: &str) -> Result<(String, String, String), String> {
     let default = sync(app, &job.repo, "repro", Some(job.id)).await?;
     sb.load(sp, &mirror(app, &job.repo), &default).await?;
     let branch = if job.issue > 0 { format!("myoffice/issue-{}", job.issue) } else { format!("myoffice/{}-{}", job.kind, job.id) };
@@ -303,16 +294,17 @@ struct Proof {
     test_commit: String,
 }
 
-async fn work(app: &App, job: &Job) -> Result<(), String> {
+async fn work(app: &App, lane: &Lane, job: &Job) -> Result<(), String> {
     let id = job.id;
     let tag = label(job);
     let repo = app.db.repo(&job.repo).ok_or("this repository was removed")?;
-    let sp = space("work", &job.repo);
-    let where_ = if app.sandbox().await.mode == Mode::Docker { "sandbox" } else { "local" };
+    let sp = lane.space(&job.repo);
+    let sb = &lane.sb;
+    let where_ = &lane.name;
     app.db.set_state(id, "repro", "preparing the repository");
     app.set("repro", "WORKING", Some(id), Some(&format!("[{where_}] takes {}", job.repo)));
     app.log("repro", Some(id), &format!("[{where_}] takes {tag}"));
-    let (base, branch, default) = prepare(app, job, &sp).await?;
+    let (base, branch, default) = prepare(app, sb, job, &sp).await?;
     app.db.update_data(id, |d| {
         d["base"] = json!(base);
         d["branch"] = json!(branch);
@@ -321,19 +313,19 @@ async fn work(app: &App, job: &Job) -> Result<(), String> {
     let suite = if repo.test_cmd.is_empty() { String::new() } else { format!("The project's full test command is `{}`; don't run all of it.\n", repo.test_cmd) };
     let context = format!("Repository: {}\nBase commit: {base}\nBranch `{branch}` is checked out.\n{suite}\n{}", job.repo, untrusted(job));
 
-    let proof = repro(app, id, &tag, &sp, &base, &context).await?;
-    fix_rounds(app, job, &repo, &sp, &base, &context, &proof).await
+    let proof = repro(app, sb, id, &tag, &sp, &base, &context).await?;
+    fix_rounds(app, sb, job, &repo, &sp, &base, &context, &proof).await
 }
 
 /// Repro writes one test commit; the office checks it really fails.
-async fn repro(app: &App, id: i64, tag: &str, sp: &str, base: &str, context: &str) -> Result<Proof, String> {
+async fn repro(app: &App, sb: &Sandbox, id: i64, tag: &str, sp: &str, base: &str, context: &str) -> Result<Proof, String> {
     let first = format!("{context}\n\nWrite the regression test for this bug.");
     let mut prompt = first.clone();
     let mut session = None;
     for attempt in 1..=REPRO_TRIES {
         app.db.set_state(id, "repro", &format!("writing a failing test (try {attempt})"));
         app.set("repro", "WORKING", Some(id), Some(&format!("sketching test for {tag}")));
-        let reply = llm::ask(app, Ask { agent: "repro", job: Some(id), system: prompts::REPRO, prompt: prompt.clone(), tools: Some(Toolbox { sb: app.sandbox().await.clone(), space: sp.to_string(), readonly: false }), resume: session.clone(), max_turns: 80, secs: 2400 }).await?;
+        let reply = llm::ask(app, Ask { agent: "repro", job: Some(id), system: prompts::REPRO, prompt: prompt.clone(), tools: Some(Toolbox { sb: sb.clone(), space: sp.to_string(), readonly: false }), resume: session.clone(), max_turns: 80, secs: 2400 }).await?;
         if !reply.session.is_empty() {
             session = Some(reply.session);
         }
@@ -341,7 +333,7 @@ async fn repro(app: &App, id: i64, tag: &str, sp: &str, base: &str, context: &st
         if let Some(g) = f["give_up"].as_str() {
             return Err(format!("Repro gave up: {g}"));
         }
-        let problem = match check_red(app, id, sp, base, &f).await? {
+        let problem = match check_red(app, sb, id, sp, base, &f).await? {
             Ok(p) => {
                 involve(app, id, "repro");
                 app.set("repro", "IDLE", None, Some(&format!("red: {}", p.tests.join(", "))));
@@ -357,8 +349,7 @@ async fn repro(app: &App, id: i64, tag: &str, sp: &str, base: &str, context: &st
 }
 
 /// Outer Ok(Err(..)) is feedback for Repro; outer Err is a real failure.
-async fn check_red(app: &App, id: i64, sp: &str, base: &str, f: &Value) -> Result<Result<Proof, String>, String> {
-    let sb = app.sandbox().await;
+async fn check_red(app: &App, sb: &Sandbox, id: i64, sp: &str, base: &str, f: &Value) -> Result<Result<Proof, String>, String> {
     let cmd = f["test_cmd"].as_str().unwrap_or("").trim().to_string();
     let tests: Vec<String> = f["tests"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).filter(|t| !t.is_empty()).map(String::from).collect();
     if cmd.is_empty() || tests.is_empty() {
@@ -385,7 +376,8 @@ async fn check_red(app: &App, id: i64, sp: &str, base: &str, f: &Value) -> Resul
 }
 
 /// Fixer writes the fix; the office checks green, CI and review. Rejections go back to Fixer.
-async fn fix_rounds(app: &App, job: &Job, repo: &Repo, sp: &str, base: &str, context: &str, proof: &Proof) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+async fn fix_rounds(app: &App, sb: &Sandbox, job: &Job, repo: &Repo, sp: &str, base: &str, context: &str, proof: &Proof) -> Result<(), String> {
     let id = job.id;
     let tag = label(job);
     let first = format!(
@@ -401,7 +393,7 @@ async fn fix_rounds(app: &App, job: &Job, repo: &Repo, sp: &str, base: &str, con
         app.wait_unpaused().await;
         app.db.set_state(id, "fix", &format!("round {round} of {FIX_ROUNDS}"));
         app.set("fixer", "WORKING", Some(id), Some(&format!("patching {tag}...")));
-        let reply = llm::ask(app, Ask { agent: "fixer", job: Some(id), system: prompts::FIXER, prompt: prompt.clone(), tools: Some(Toolbox { sb: app.sandbox().await.clone(), space: sp.to_string(), readonly: false }), resume: session.clone(), max_turns: 100, secs: 3600 }).await?;
+        let reply = llm::ask(app, Ask { agent: "fixer", job: Some(id), system: prompts::FIXER, prompt: prompt.clone(), tools: Some(Toolbox { sb: sb.clone(), space: sp.to_string(), readonly: false }), resume: session.clone(), max_turns: 100, secs: 3600 }).await?;
         if !reply.session.is_empty() {
             session = Some(reply.session);
         }
@@ -411,8 +403,8 @@ async fn fix_rounds(app: &App, job: &Job, repo: &Repo, sp: &str, base: &str, con
         }
         app.set("fixer", "IDLE", None, Some(&format!("done: {}", f["title"].as_str().unwrap_or(&job.title))));
         involve(app, id, "fixer");
-        match check_fix(app, job, repo, sp, base, proof, &f).await? {
-            None => return ready(app, id, repo, sp, base, f).await,
+        match check_fix(app, sb, job, repo, sp, base, proof, &f).await? {
+            None => return ready(app, sb, id, repo, sp, base, f).await,
             Some(problem) => {
                 app.log("fixer", Some(id), &format!("round {round} rejected: {}", sh::head(&problem, 300)));
                 let feedback = format!("Your fix was rejected:\n\n{problem}\n\nFix that. Keep the test commit unchanged and exactly one fix commit on top of it, then answer again with the same JSON.");
@@ -425,9 +417,9 @@ async fn fix_rounds(app: &App, job: &Job, repo: &Repo, sp: &str, base: &str, con
 }
 
 /// None = green, CI passed and the reviewer approved. Some(problem) = feedback for Fixer.
-async fn check_fix(app: &App, job: &Job, repo: &Repo, sp: &str, base: &str, proof: &Proof, f: &Value) -> Result<Option<String>, String> {
+#[allow(clippy::too_many_arguments)]
+async fn check_fix(app: &App, sb: &Sandbox, job: &Job, repo: &Repo, sp: &str, base: &str, proof: &Proof, f: &Value) -> Result<Option<String>, String> {
     let id = job.id;
-    let sb = app.sandbox().await;
     let n = commits_since(sb, sp, base).await?;
     if n != 2 {
         return Ok(Some(format!("Expected exactly 2 commits on top of {base} (the test, then your fix), found {n}.")));
@@ -526,9 +518,10 @@ fn green_problem(o: &sh::Out) -> Option<String> {
     (o.code != 0).then(|| format!("The regression test still fails with your fix (exit {}):\n{}", o.code, both(o)))
 }
 
-async fn ready(app: &App, id: i64, repo: &Repo, sp: &str, base: &str, f: Value) -> Result<(), String> {
-    let sb = app.sandbox().await;
+async fn ready(app: &App, sb: &Sandbox, id: i64, repo: &Repo, sp: &str, base: &str, f: Value) -> Result<(), String> {
     let job = app.db.job(id).ok_or("job vanished")?;
+    // The verified commits go to the host mirror now, so any free lane can submit them later.
+    sb.export(sp, &mirror(app, &job.repo), job.data["branch"].as_str().unwrap_or(""), base).await?;
     let range = q(&format!("{base}..HEAD"));
     let diff = sb.ok(sp, &format!("git diff {range}"), 60).await?;
     let files: Vec<String> = sb.ok(sp, &format!("git diff --name-only {range}"), 60).await?.lines().map(String::from).collect();
@@ -570,20 +563,23 @@ fn pr_body(job: &Job, f: &Value, auto: bool) -> String {
 
 // ================================================================ Submit
 
-async fn submit(app: &App, job: &Job) -> Result<(), String> {
+async fn submit(app: &App, lane: &Lane, job: &Job) -> Result<(), String> {
     let id = job.id;
-    let sb = app.sandbox().await;
+    let sb = &lane.sb;
     let s = |k: &str| job.data[k].as_str().unwrap_or("").to_string();
     let (branch, base) = (s("branch"), s("base"));
-    let sp = space("work", &job.repo);
+    let sp = lane.space(&job.repo);
     let m = mirror(app, &job.repo);
     app.db.set_state(id, "submit", "pre-push gate");
     app.set("submit", "WORKING", Some(id), Some(&format!("pre-push gate {}", label(job))));
-    sb.ok(&sp, &format!("git checkout -q -f {}", q(&branch)), 60).await?;
 
-    // Pre-push gate: if the default branch moved, rebase in the sandbox and prove it again.
+    // Start from the verified commits in the mirror (they may have been built on another lane).
     let default = sync(app, &job.repo, "submit", Some(id)).await?;
     sb.load(&sp, &m, &default).await?;
+    sb.load(&sp, &m, &branch).await?;
+    sb.ok(&sp, &format!("git checkout -q -f -B {} {} && git clean -fdq", q(&branch), q(&format!("origin/{branch}"))), 60).await?;
+
+    // Pre-push gate: if the default branch moved, rebase in the sandbox and prove it again.
     let tip = rev(sb, &sp, &format!("origin/{default}")).await?;
     if tip != base {
         app.log("submit", Some(id), "default branch moved, rebasing and re-checking the proof");

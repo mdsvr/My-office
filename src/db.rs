@@ -54,7 +54,25 @@ create table if not exists tokens(
   usd real not null default 0,
   primary key(day, agent));
 create table if not exists settings(k text primary key, v text not null);
+create table if not exists machines(
+  id text primary key,
+  name text not null,
+  host text not null default '',
+  lanes integer not null default 1,
+  enabled integer not null default 1);
+insert or ignore into machines(id, name, host, lanes) values('me', 'ME', '', 1);
 ";
+
+/// Where jobs run: this PC ("me", host "") or another machine's Docker (`ssh://user@host`).
+#[derive(Clone, Serialize)]
+pub struct Machine {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    /// Jobs it runs at the same time.
+    pub lanes: i64,
+    pub enabled: bool,
+}
 
 #[derive(Clone, Serialize)]
 pub struct Repo {
@@ -192,9 +210,40 @@ impl Db {
         self.query_jobs("where state=?1 order by id", params![state])
     }
 
+    /// Takes the next job for a lane in one locked step, so two lanes never get the same one.
     /// Approved jobs first, so a PR you approved doesn't wait behind new fixes.
-    pub fn next_job(&self) -> Option<Job> {
-        self.query_jobs("where state in ('approved','ready') order by state='ready', id limit 1", []).pop()
+    pub fn claim(&self, lane: &str) -> Option<Job> {
+        let c = self.c();
+        let mut s = c.prepare(&format!("select {COLS} from jobs where state in ('approved','ready') order by state='ready', id limit 1")).unwrap();
+        let j = s.query_row([], job_row).optional().unwrap()?;
+        let state = if j.state == "approved" { "submit" } else { "repro" };
+        c.execute("update jobs set state=?2, why=?3, updated=?4 where id=?1", params![j.id, state, format!("taken by {lane}"), now()]).unwrap();
+        Some(j)
+    }
+
+    pub fn machines(&self) -> Vec<Machine> {
+        let c = self.c();
+        let mut s = c.prepare("select id, name, host, lanes, enabled from machines order by id='me' desc, name").unwrap();
+        let v = s
+            .query_map([], |r| Ok(Machine { id: r.get(0)?, name: r.get(1)?, host: r.get(2)?, lanes: r.get(3)?, enabled: r.get(4)? }))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        v
+    }
+
+    pub fn save_machine(&self, m: &Machine) {
+        self.c()
+            .execute(
+                "insert into machines(id, name, host, lanes, enabled) values(?1, ?2, ?3, ?4, ?5)
+                 on conflict(id) do update set name=excluded.name, host=excluded.host, lanes=excluded.lanes, enabled=excluded.enabled",
+                params![m.id, m.name, m.host, m.lanes, m.enabled],
+            )
+            .unwrap();
+    }
+
+    pub fn delete_machine(&self, id: &str) {
+        self.c().execute("delete from machines where id=?1 and id<>'me'", params![id]).unwrap();
     }
 
     pub fn open_prs(&self) -> Vec<Job> {
@@ -271,5 +320,28 @@ impl Db {
 
     pub fn set(&self, k: &str, v: &str) {
         self.c().execute("insert into settings(k, v) values(?1, ?2) on conflict(k) do update set v=excluded.v", params![k, v]).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lanes claim jobs one at a time: approved first, never the same job twice.
+    #[test]
+    fn claim_is_exclusive() {
+        let f = std::env::temp_dir().join(format!("myoffice-db-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&f);
+        let db = Db::open(&f).unwrap();
+        let a = db.add_job("o/r", 1, "issue", "a", "", "ready", "", &json!({}));
+        let b = db.add_job("o/r", 2, "issue", "b", "", "approved", "", &json!({}));
+        let first = db.claim("ME/1").unwrap();
+        assert_eq!(first.id, b, "approved goes first");
+        assert_eq!(db.job(b).unwrap().state, "submit");
+        assert_eq!(db.claim("ME/2").unwrap().id, a);
+        assert!(db.claim("ME/3").is_none(), "nothing left to take");
+        assert_eq!(db.machines()[0].id, "me", "this PC is always there");
+        drop(db);
+        let _ = std::fs::remove_file(&f);
     }
 }

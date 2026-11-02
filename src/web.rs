@@ -38,6 +38,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/providers", get(providers))
         .route("/api/models", get(models))
         .route("/api/provider", post(save_provider))
+        .route("/api/machine", post(save_machine))
+        .route("/api/machine/delete", post(delete_machine))
         .route("/api/agent/test", post(test_agent))
         .route("/api/office/pause", post(pause))
         .fallback(get(static_file))
@@ -131,6 +133,7 @@ async fn state(State(app): S) -> Json<Value> {
         "jobs": app.db.jobs(200).iter().map(summary).collect::<Vec<_>>(),
         "events": app.db.events(200),
         "repos": app.db.repos(),
+        "machines": machines(&app),
     }))
 }
 
@@ -310,4 +313,71 @@ async fn save_provider(State(app): S, Json(b): Json<Value>) -> Json<Value> {
     app.log("watcher", None, &format!("provider {} updated", p.name));
     app.changed();
     ok()
+}
+
+// ---------------------------------------------------------------- machines (workers)
+
+fn machines(app: &App) -> Vec<Value> {
+    let status = app.machine_status.lock().unwrap().clone();
+    let up = app.lanes_up.lock().unwrap().clone();
+    app.db
+        .machines()
+        .into_iter()
+        .map(|m| {
+            let running = up.iter().filter(|k| k.starts_with(&format!("{}#", m.id))).count();
+            json!({"id": m.id, "name": m.name, "host": m.host, "lanes": m.lanes, "enabled": m.enabled, "running": running,
+                   "status": status.get(&m.id).cloned().unwrap_or_else(|| "starting...".into())})
+        })
+        .collect()
+}
+
+/// Add or change a machine. Remote ones are another computer's Docker, reached over SSH with a key.
+async fn save_machine(State(app): S, Json(b): Json<Value>) -> Json<Value> {
+    let lanes = b["lanes"].as_i64().unwrap_or(1);
+    if !(1..=16).contains(&lanes) {
+        return err("lanes must be 1 to 16");
+    }
+    let id = b["id"].as_str().unwrap_or("").trim().to_string();
+    let existing = app.db.machines().into_iter().find(|m| m.id == id);
+    let host = if id == "me" { String::new() } else { b["host"].as_str().unwrap_or("").trim().to_string() };
+    if id != "me" && !valid_host(&host) {
+        return err("use ssh://user@host (the machine needs Docker and your SSH key)");
+    }
+    let name = b["name"].as_str().map(str::trim).filter(|n| !n.is_empty()).map(String::from).or(existing.as_ref().map(|m| m.name.clone())).unwrap_or_else(|| host.trim_start_matches("ssh://").into());
+    let id = if id.is_empty() { format!("m{}", crate::db::now_ms()) } else { id };
+    app.db.save_machine(&crate::db::Machine { id: id.clone(), name: name.clone(), host, lanes, enabled: b["enabled"].as_bool().unwrap_or(true) });
+    // A changed address is reconnected on next use.
+    app.remote.lock().await.remove(&id);
+    app.machine_status.lock().unwrap().remove(&id);
+    app.log("watcher", None, &format!("machine {name}: {lanes} lane(s)"));
+    app.changed();
+    ok()
+}
+
+async fn delete_machine(State(app): S, Json(b): Json<Value>) -> Json<Value> {
+    let id = b["id"].as_str().unwrap_or("");
+    if id == "me" {
+        return err("this PC can't be removed; set it to fewer lanes instead");
+    }
+    app.db.delete_machine(id);
+    app.remote.lock().await.remove(id);
+    app.changed();
+    ok()
+}
+
+/// `ssh://user@host` or `ssh://user@host:port`, nothing else (it ends up in a docker command).
+fn valid_host(h: &str) -> bool {
+    Regex::new(r"^ssh://[\w.-]+@[\w.-]+(:\d+)?$").unwrap().is_match(h)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn machine_hosts() {
+        assert!(super::valid_host("ssh://me@build-box"));
+        assert!(super::valid_host("ssh://me@10.0.0.5:2222"));
+        assert!(!super::valid_host("build-box"));
+        assert!(!super::valid_host("ssh://me@box; rm -rf /"));
+        assert!(!super::valid_host("tcp://box:2375"));
+    }
 }
