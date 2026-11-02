@@ -195,7 +195,7 @@ const INITIAL_AGENTS = [
 // --- LIVE DATA FROM THE MY OFFICE SERVER ---
 const H = { 'content-type': 'application/json', 'x-myoffice': '1' };
 
-async function api(path, body) {
+async function api(path, body = {}) {
   const r = await fetch(path, { method: 'POST', headers: H, body: JSON.stringify(body || {}) });
   const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
   if (j.error) alert(j.error);
@@ -550,11 +550,11 @@ const MangaPlant = ({ label }) => {
 };
 
 // --- STUDIO BOOMBOX / LO-FI RADIO SVG (Matches the radio icon to the right of the office sign!) ---
-const StudioBoombox = ({ playing, onToggle }) => {
+const StudioBoombox = ({ playing, station, onToggle, onTune }) => {
   return (
     <div 
-      onClick={onToggle}
-      title="Click to toggle MY OFFICE Lo-Fi Hip-Hop Radio! 📻"
+      onClick={station ? onToggle : onTune}
+      title={station ? `${playing ? 'Pause' : 'Play'} ${station.name} 📻` : 'Pick a radio station 📻'}
       className={`cursor-pointer select-none flex items-center gap-2.5 px-3 py-1.5 rounded-xl border-2 border-[#1a1a1a] bg-white text-[#1a1a1a] shadow-[3px_3px_0px_#1a1a1a] transition-transform hover:-translate-y-0.5 ${
         playing ? 'ring-2 ring-pink-400' : 'opacity-80'
       }`}
@@ -589,9 +589,203 @@ const StudioBoombox = ({ playing, onToggle }) => {
         <div className="text-[9px] font-mono font-black uppercase tracking-wider text-pink-600">
           MY OFFICE FM
         </div>
-        <div className="text-[11px] font-black">
-          {playing ? 'Lo-Fi Beats ON' : 'Radio Paused'}
+        <div className="text-[11px] font-black max-w-[130px] truncate">
+          {!station ? 'Pick a station' : playing ? station.name : 'Radio Paused'}
         </div>
+      </div>
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          onTune();
+        }}
+        className="ml-1 px-1.5 py-0.5 rounded border-2 border-[#1a1a1a] bg-amber-200 text-[9px] font-black hover:bg-amber-300"
+        title="Find a station"
+      >
+        TUNE
+      </button>
+    </div>
+  );
+};
+
+// --- MY OFFICE FM: real internet radio from the free Radio Browser directory (radio-browser.info) ---
+const RADIO_HOSTS = ['https://de1.api.radio-browser.info', 'https://de2.api.radio-browser.info', 'https://all.api.radio-browser.info'];
+const RADIO_KEY = 'myoffice-radio';
+
+async function searchStations(params) {
+  const q = new URLSearchParams({ hidebroken: 'true', order: 'clickcount', reverse: 'true', limit: '60', ...params });
+  for (const host of RADIO_HOSTS) {
+    try {
+      const r = await fetch(`${host}/json/stations/search?${q}`);
+      if (!r.ok) continue;
+      // HLS (.m3u8) streams don't play in a plain <audio> tag, so leave them out.
+      return (await r.json()).filter((s) => !s.hls && s.url_resolved).slice(0, 40);
+    } catch {
+      // try the next mirror
+    }
+  }
+  throw new Error('Radio directory unreachable');
+}
+
+function loadRadio() {
+  try {
+    return JSON.parse(localStorage.getItem(RADIO_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+
+// One <audio> for the whole page. Remembers your station and volume in this browser.
+function useRadio() {
+  const saved = loadRadio();
+  const audio = useRef(null);
+  const [station, setStation] = useState(saved.station || null);
+  const [volume, setVolume] = useState(saved.volume ?? 0.6);
+  const [playing, setPlaying] = useState(false);
+  const [error, setError] = useState('');
+
+  if (!audio.current && typeof Audio !== 'undefined') audio.current = new Audio();
+
+  useEffect(() => {
+    const a = audio.current;
+    if (!a) return;
+    const onErr = () => { setPlaying(false); setError('This station is not reachable right now. Pick another one.'); };
+    const onPlay = () => { setPlaying(true); setError(''); };
+    const onPause = () => setPlaying(false);
+    a.addEventListener('error', onErr);
+    a.addEventListener('playing', onPlay);
+    a.addEventListener('pause', onPause);
+    return () => { a.pause(); a.removeEventListener('error', onErr); a.removeEventListener('playing', onPlay); a.removeEventListener('pause', onPause); };
+  }, []);
+
+  useEffect(() => {
+    if (audio.current) audio.current.volume = volume;
+    try { localStorage.setItem(RADIO_KEY, JSON.stringify({ ...loadRadio(), station, volume })); } catch {}
+  }, [station, volume]);
+
+  const play = (s = station) => {
+    const a = audio.current;
+    if (!a || !s) return;
+    if (a.src !== s.url) a.src = s.url;
+    setStation(s);
+    setError('');
+    a.play().catch(() => setError('The browser blocked playback. Click play again.'));
+  };
+  const toggle = () => (playing ? audio.current?.pause() : play());
+  return { station, volume, setVolume, playing, error, play, toggle };
+}
+
+const RadioTuner = ({ radio, onClose }) => {
+  // Your last country, else your browser's region. Change it once (e.g. IN) and it sticks.
+  const country = loadRadio().cc || (navigator.language.split('-')[1] || 'IN').toUpperCase();
+  const [cc, setCc] = useState(country);
+  const [name, setName] = useState('');
+  const [results, setResults] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  const run = async (params) => {
+    try { localStorage.setItem(RADIO_KEY, JSON.stringify({ ...loadRadio(), cc })); } catch {}
+    setBusy(true);
+    setMsg('');
+    try {
+      const r = await searchStations(params);
+      setResults(r);
+      if (!r.length) setMsg('No stations found. Try another name or country.');
+    } catch (e) {
+      setMsg(String(e.message || e));
+    }
+    setBusy(false);
+  };
+  const local = () => run({ countrycode: cc });
+  useEffect(() => { local(); }, []);
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4" onClick={onClose}>
+      <div className="manga-panel rounded-2xl bg-[#fffdf9] text-[#1a1a1a] max-w-xl w-full p-5 relative max-h-[90vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+        <button onClick={onClose} className="absolute top-3 right-3 w-7 h-7 rounded-full border-2 border-[#1a1a1a] bg-rose-300 flex items-center justify-center font-black">
+          <X className="w-4 h-4" />
+        </button>
+
+        <div className="flex items-center gap-2 mb-3">
+          <span className="px-2 py-0.5 bg-[#1a1a1a] text-white font-black text-xs rounded">MY OFFICE FM // TUNER</span>
+          <span className="text-xs font-bold text-pink-600">ラジオ</span>
+        </div>
+
+        {/* Now playing + volume */}
+        <div className="p-2.5 mb-3 rounded-xl border-2 border-[#1a1a1a] bg-amber-50 flex items-center gap-3 shadow-[2px_2px_0px_#1a1a1a]">
+          <button
+            onClick={radio.toggle}
+            disabled={!radio.station}
+            className="manga-btn w-9 h-9 shrink-0 rounded-full bg-pink-300 flex items-center justify-center disabled:opacity-40"
+            title={radio.playing ? 'Pause' : 'Play'}
+          >
+            {radio.playing ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 fill-current" />}
+          </button>
+          <div className="min-w-0 flex-1">
+            <div className="text-[9px] font-mono font-black text-pink-600">{radio.playing ? 'ON AIR' : 'NOW TUNED'}</div>
+            <div className="text-xs font-black truncate">{radio.station ? radio.station.name : 'No station yet — pick one below'}</div>
+            {radio.station && <div className="text-[10px] font-mono opacity-60 truncate">{radio.station.where}</div>}
+          </div>
+          <label className="flex items-center gap-1 text-[10px] font-black shrink-0">
+            VOL
+            <input type="range" min="0" max="1" step="0.05" value={radio.volume} onChange={(e) => radio.setVolume(+e.target.value)} className="w-20 accent-pink-500" />
+          </label>
+        </div>
+        {radio.error && <div className="text-[11px] font-bold text-rose-600 mb-2">{radio.error}</div>}
+
+        {/* Search */}
+        <form
+          className="flex flex-wrap gap-2 mb-2"
+          onSubmit={(e) => { e.preventDefault(); run({ countrycode: cc, ...(name.trim() ? { name: name.trim() } : {}) }); }}
+        >
+          <input
+            value={cc}
+            onChange={(e) => setCc(e.target.value.toUpperCase().slice(0, 2))}
+            title="Country code, e.g. IN, US, GB, JP"
+            className="w-14 px-2 py-1.5 rounded-lg border-2 border-[#1a1a1a] bg-white font-mono text-xs text-center"
+          />
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="station name, e.g. Mirchi, Red FM, BBC"
+            className="flex-1 min-w-[140px] px-3 py-1.5 rounded-lg border-2 border-[#1a1a1a] bg-white font-mono text-xs focus:outline-none focus:ring-2 focus:ring-pink-400"
+          />
+          <button className="manga-btn px-3 py-1.5 rounded-lg bg-sky-200 text-xs font-black flex items-center gap-1">
+            <Search className="w-3.5 h-3.5" /> Search
+          </button>
+        </form>
+        <div className="flex flex-wrap gap-1.5 mb-3 text-[10px] font-black">
+          <button onClick={local} className="px-2 py-0.5 rounded border border-[#1a1a1a] bg-white hover:bg-amber-100">📍 Local ({cc})</button>
+          <button onClick={() => run({ tag: 'lofi' })} className="px-2 py-0.5 rounded border border-[#1a1a1a] bg-white hover:bg-amber-100">🎧 Lo-fi</button>
+          <button onClick={() => run({ tag: 'jazz' })} className="px-2 py-0.5 rounded border border-[#1a1a1a] bg-white hover:bg-amber-100">🎷 Jazz</button>
+          <button onClick={() => run({ tag: 'anime' })} className="px-2 py-0.5 rounded border border-[#1a1a1a] bg-white hover:bg-amber-100">🌸 Anime</button>
+        </div>
+
+        {/* Results */}
+        <div className="flex-1 overflow-y-auto pr-1 space-y-1.5 min-h-[120px]">
+          {busy && <div className="text-xs font-mono opacity-60">tuning… チューニング中</div>}
+          {!busy && msg && <div className="text-xs font-bold text-rose-600">{msg}</div>}
+          {!busy &&
+            (results || []).map((s) => {
+              const st = { name: s.name.trim(), url: s.url_resolved, where: [s.state, s.country].filter(Boolean).join(', ') + ` · ${s.codec || '?'} ${s.bitrate ? s.bitrate + 'kbps' : ''}` };
+              const on = radio.station?.url === st.url;
+              return (
+                <div key={s.stationuuid} className={`flex items-center gap-2 p-2 rounded-lg border-2 border-[#1a1a1a] ${on ? 'bg-pink-100' : 'bg-white'}`}>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-black truncate">{st.name}</div>
+                    <div className="text-[10px] font-mono opacity-60 truncate">{st.where}</div>
+                  </div>
+                  <button
+                    onClick={() => (on && radio.playing ? radio.toggle() : radio.play(st))}
+                    className="px-2 py-0.5 rounded border border-[#1a1a1a] bg-emerald-200 hover:bg-emerald-300 text-[10px] font-black shrink-0 flex items-center gap-1"
+                  >
+                    {on && radio.playing ? <><Pause className="w-3 h-3" /> Pause</> : <><Play className="w-3 h-3 fill-current" /> Play</>}
+                  </button>
+                </div>
+              );
+            })}
+        </div>
+        <div className="text-[9px] font-mono opacity-50 mt-2">Stations from radio-browser.info · streams come straight from each station</div>
       </div>
     </div>
   );
@@ -613,7 +807,8 @@ export default function App() {
   useEffect(() => {
     try { localStorage.setItem('myoffice-theme', themeMode); } catch {}
   }, [themeMode]);
-  const [lofiPlaying, setLofiPlaying] = useState(true);
+  const radio = useRadio();
+  const [showTuner, setShowTuner] = useState(false);
   const [matchaAgentId, setMatchaAgentId] = useState(null);
   const [localLogs, setLocalLogs] = useState([]); // matcha moments stay in the browser
   const [clockStr, setClockStr] = useState('');
@@ -686,7 +881,7 @@ export default function App() {
   // "Test Agent": a tiny real request with the agent's model.
   const handleSoloAgentAction = (agent) => api('/api/agent/test', { agent: agent.id });
 
-  const handleMergePr = async (prId, e) => {
+  const handleMergePr = async (prId, e = null) => {
     if (e) e.stopPropagation();
     if (!confirm('Merge this pull request on GitHub now?')) return;
     const r = await api('/api/pr/merge', { id: prId });
@@ -1029,8 +1224,10 @@ export default function App() {
 
               {/* Right Vintage Studio Boombox / Lo-Fi Radio SVG */}
               <StudioBoombox
-                playing={lofiPlaying}
-                onToggle={() => setLofiPlaying(!lofiPlaying)}
+                playing={radio.playing}
+                station={radio.station}
+                onToggle={radio.toggle}
+                onTune={() => setShowTuner(true)}
               />
             </div>
 
@@ -1770,7 +1967,7 @@ export default function App() {
                     OS: {office.machine.os} · CPUs: {office.machine.cpus} · Docker: {office.machine.docker ? `yes (${office.machine.docker})` : 'not running'}
                   </div>
                   <div className="font-mono text-[11px] opacity-80">
-                    Sandbox: none yet, agents run on this PC · Tokens today: {Object.values(office.agents).reduce((n: number, a: any) => n + (a.tokens || 0), 0)}k tok
+                    Sandbox: none yet, agents run on this PC · Tokens today: {Object.values(office.agents).reduce((n: number, a: any) => n + (a.tokens || 0), 0) as number}k tok
                   </div>
                 </div>
               </div>
@@ -1848,6 +2045,7 @@ export default function App() {
           </div>
         </div>
       )}
+      {showTuner && <RadioTuner radio={radio} onClose={() => setShowTuner(false)} />}
     </div>
   );
 }

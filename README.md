@@ -18,6 +18,13 @@ Open http://127.0.0.1:47400. Then **Repos → add `owner/repo`** with its test c
 Every fix waits in the QUEUE panel as **WAITING FOR YOU** until you approve it, unless you turn on
 Auto-PR for that repository.
 
+**Hunter**: tick "Let HUNTER look for unreported bugs" on a repo, and once a day it reads the code
+(read-only) and reports up to 3 bugs, which go through Guard and Vet like issues.
+
+**MY OFFICE FM**: click **TUNE** on the boombox to search internet radio (local stations by country code,
+or by name, or Lo-fi/Jazz/Anime). Click the boombox to play or pause. Your station, volume and country are
+remembered in this browser. Stations come from [radio-browser.info](https://www.radio-browser.info).
+
 Settings via environment variables: `MYOFFICE_PORT` (47400), `MYOFFICE_DATA` (`./data`),
 `MYOFFICE_CLAUDE` (path to `claude.exe`), `MYOFFICE_BASH` (path to bash).
 
