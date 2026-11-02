@@ -195,13 +195,18 @@ async fn job_action(State(app): S, Json(b): Json<Value>) -> Json<Value> {
     let (allowed, state, why) = match b["action"].as_str().unwrap_or("") {
         "approve" => (j.state == "approve", "approved", "approved by you"),
         "reject" => (matches!(j.state.as_str(), "approve" | "ready" | "vet"), "dropped", "rejected by you"),
-        "retry" => (matches!(j.state.as_str(), "dropped" | "skipped" | "blocked"), "ready", "retry requested"),
+        // Back through Guard (never skip the injection check); `manual` makes Vet accept your call.
+        "retry" => (matches!(j.state.as_str(), "dropped" | "skipped" | "blocked"), "vet", "retry requested, Guard checks it first"),
         _ => (false, "", ""),
     };
     if !allowed {
         return err(format!("can't do that while the job is '{}'", j.state));
     }
     app.db.set_state(id, state, why);
+    if state == "vet" {
+        app.db.update_data(id, |d| d["manual"] = json!(true));
+        app.scan.notify_one();
+    }
     app.log("submit", Some(id), &format!("{}: {why}", pipeline::label(&j)));
     app.wake.notify_one();
     ok()

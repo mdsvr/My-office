@@ -30,7 +30,12 @@ pub const EDIT: &str = "Read,Edit,Write,Glob,Grep,Bash";
 pub const READ: &str = "Read,Glob,Grep";
 // ponytail: Claude Code's permission rules are the only fence here, and Bash runs on your own PC.
 // Phase 5 of PLAN.md moves this into Docker; until then only add repos you trust.
-const DENY: &[&str] = &["Bash(git push:*)", "Bash(git remote:*)", "Bash(git config:*)", "Bash(gh:*)", "Bash(curl:*)", "Bash(wget:*)", "Bash(ssh:*)"];
+const DENY: &[&str] = &[
+    "Bash(git push:*)", "Bash(git remote:*)", "Bash(git config:*)", "Bash(gh:*)", "Bash(curl:*)", "Bash(wget:*)", "Bash(ssh:*)",
+    // No installing into your system: global packages outlive the job and change your PC.
+    "Bash(pip:*)", "Bash(pip3:*)", "Bash(py -m pip:*)", "Bash(py -3 -m pip:*)", "Bash(python -m pip:*)", "Bash(python3 -m pip:*)",
+    "Bash(npm install -g:*)", "Bash(npm i -g:*)", "Bash(cargo install:*)", "Bash(winget:*)", "Bash(choco:*)",
+];
 
 /// The real claude.exe. `claude` on PATH may be an older copy or a .cmd wrapper
 /// (Rust can't pass multi-line arguments through .cmd files).
@@ -63,9 +68,16 @@ pub async fn ask(app: &App, a: Ask<'_>) -> Result<Reply, String> {
         args.extend(["--resume", s.as_str()]);
     }
     let bin = claude_bin();
+    // Its own temp folder for programs that read TEMP (Python tempfile, npm, ...).
+    // ponytail: Git Bash's /tmp ignores this and stays the Windows temp folder; Docker would close that.
+    let tmp = app.data.join("tmp").join(a.agent);
+    let _ = std::fs::create_dir_all(&tmp);
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.args(&args)
         .current_dir(a.cwd)
+        .env("TEMP", &tmp)
+        .env("TMP", &tmp)
+        .env("TMPDIR", &tmp)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
