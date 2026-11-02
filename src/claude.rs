@@ -59,9 +59,12 @@ pub async fn ask(app: &App, a: Ask<'_>) -> Result<Reply, String> {
         std::fs::write(&f, json!({"mcpServers": {"office": server}}).to_string()).map_err(|e| e.to_string())?;
         cfg = Some(f);
     }
-    let cfg_s = cfg.as_ref().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    // Always strict: otherwise Claude also loads the connectors of your claude.ai account
+    // (Gmail, Drive, Notion, ...) while reading issue text written by strangers.
+    let cfg_s = cfg.as_ref().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| r#"{"mcpServers":{}}"#.into());
+    args.extend(["--strict-mcp-config", "--mcp-config", &cfg_s]);
     if cfg.is_some() {
-        args.extend(["--mcp-config", &cfg_s, "--strict-mcp-config", "--allowedTools", "mcp__office"]);
+        args.extend(["--allowedTools", "mcp__office"]);
     }
     if let Some(s) = &a.resume {
         args.extend(["--resume", s.as_str()]);
