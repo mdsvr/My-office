@@ -7,6 +7,7 @@ mod prompts;
 mod sandbox;
 mod sh;
 mod tools;
+mod watcher;
 mod web;
 mod workers;
 
@@ -227,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
     });
     tokio::spawn(pipeline::scout_loop(app.clone()));
     tokio::spawn(workers::supervise(app.clone()));
-    tokio::spawn(pipeline::watch_loop(app.clone()));
+    tokio::spawn(watcher::watch_loop(app.clone()));
 
     // ponytail: localhost only, no login. Add a login link before exposing it to a network.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;

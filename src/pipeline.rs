@@ -31,11 +31,11 @@ pub fn label(j: &Job) -> String {
     }
 }
 
-fn untrusted(j: &Job) -> String {
+pub(crate) fn untrusted(j: &Job) -> String {
     format!("<untrusted-issue>\n{}\n\n{}\n</untrusted-issue>", j.title, sh::head(j.data["body"].as_str().unwrap_or(""), 8000))
 }
 
-fn involve(app: &App, id: i64, agent: &str) {
+pub(crate) fn involve(app: &App, id: i64, agent: &str) {
     app.db.update_data(id, |d| {
         let mut v: Vec<Value> = d["agents"].as_array().cloned().unwrap_or_default();
         if !v.iter().any(|x| x == agent) {
@@ -157,19 +157,19 @@ async fn vet_all(app: &App) -> Result<(), String> {
 // ================================================================ Repos: host mirror + sandbox
 
 /// The host's bare copy of a repo. Only the office writes it: fetch from and push to GitHub.
-fn mirror(app: &App, repo: &str) -> PathBuf {
+pub(crate) fn mirror(app: &App, repo: &str) -> PathBuf {
     app.data.join("mirror").join(format!("{}.git", repo.replace('/', "__")))
 }
 
 /// git on the host mirror, logged in through gh (private repos work too).
-async fn host_git(dir: &Path, args: &[&str], secs: u64) -> Result<String, String> {
+pub(crate) async fn host_git(dir: &Path, args: &[&str], secs: u64) -> Result<String, String> {
     let mut a = vec!["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"];
     a.extend_from_slice(args);
     sh::ok("git", &a, dir, secs).await
 }
 
 /// Brings the mirror's default branch up to date. Returns the default branch name.
-async fn sync(app: &App, repo: &str, agent: &str, job: Option<i64>) -> Result<String, String> {
+pub(crate) async fn sync(app: &App, repo: &str, agent: &str, job: Option<i64>) -> Result<String, String> {
     let default = sh::ok("gh", &["repo", "view", repo, "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"], &app.data, 60).await?.trim().to_string();
     let m = mirror(app, repo);
     if !m.exists() {
@@ -181,21 +181,21 @@ async fn sync(app: &App, repo: &str, agent: &str, job: Option<i64>) -> Result<St
     Ok(default)
 }
 
-async fn rev(sb: &Sandbox, sp: &str, r: &str) -> Result<String, String> {
+pub(crate) async fn rev(sb: &Sandbox, sp: &str, r: &str) -> Result<String, String> {
     Ok(sb.ok(sp, &format!("git rev-parse {}", q(r)), 30).await?.trim().to_string())
 }
 
-async fn commits_since(sb: &Sandbox, sp: &str, base: &str) -> Result<i64, String> {
+pub(crate) async fn commits_since(sb: &Sandbox, sp: &str, base: &str) -> Result<i64, String> {
     Ok(sb.ok(sp, &format!("git rev-list --count {}", q(&format!("{base}..HEAD"))), 30).await?.trim().parse().unwrap_or(-1))
 }
 
-async fn dirty(sb: &Sandbox, sp: &str) -> Result<Option<String>, String> {
+pub(crate) async fn dirty(sb: &Sandbox, sp: &str) -> Result<Option<String>, String> {
     let s = sb.ok(sp, "git status --porcelain", 30).await?;
     Ok((!s.trim().is_empty()).then(|| format!("The working tree is not clean. Commit or delete these:\n{}", sh::head(&s, 1500))))
 }
 
 /// Runs a command on the checked-out commit, then removes what it left behind.
-async fn run_here(sb: &Sandbox, sp: &str, cmd: &str, secs: u64) -> sh::Out {
+pub(crate) async fn run_here(sb: &Sandbox, sp: &str, cmd: &str, secs: u64) -> sh::Out {
     sb.sh(sp, &format!("{{ {cmd}\n}}; e=$?; git checkout -q -f -- . 2>/dev/null; git clean -fdq 2>/dev/null; exit $e"), secs).await
 }
 
@@ -262,7 +262,9 @@ pub async fn add_issue(app: &App, repo: &str, n: i64) -> Result<(), String> {
 /// Runs one claimed job on a lane: build and verify a fix, or submit an approved one.
 pub async fn run_job(app: &App, lane: &Lane, job: Job) {
     let id = job.id;
-    if job.state == "approved" {
+    if matches!(job.kind.as_str(), "review" | "rebase") {
+        crate::watcher::run(app, lane, &job).await;
+    } else if job.state == "approved" {
         if let Err(e) = submit(app, lane, &job).await {
             // A failed push shouldn't throw the verified fix away.
             app.db.set_state(id, "approve", &format!("submit failed: {}", sh::head(&e, 300)));
@@ -304,6 +306,9 @@ async fn work(app: &App, lane: &Lane, job: &Job) -> Result<(), String> {
     app.db.set_state(id, "repro", "preparing the repository");
     app.set("repro", "WORKING", Some(id), Some(&format!("[{where_}] takes {}", job.repo)));
     app.log("repro", Some(id), &format!("[{where_}] takes {tag}"));
+    if issue_closed(app, job).await {
+        return Err("the issue was closed meanwhile (someone was faster)".into());
+    }
     let (base, branch, default) = prepare(app, sb, job, &sp).await?;
     app.db.update_data(id, |d| {
         d["base"] = json!(base);
@@ -441,7 +446,15 @@ async fn check_fix(app: &App, sb: &Sandbox, job: &Job, repo: &Repo, sp: &str, ba
         d["proof"]["green_tail"] = json!(sh::tail(&out.out, 1500));
     });
     app.log("fixer", Some(id), "proof ok: the test fails without the fix and passes with it");
+    let explain = format!("Cause: {}\nFix: {}", f["cause"].as_str().unwrap_or(""), f["fix"].as_str().unwrap_or(""));
+    ci_and_review(app, sb, job, repo, sp, base, &untrusted(job), &explain).await
+}
 
+/// The project's full test suite, then the Reviewer on the diff since `base`.
+/// None = both passed. Some(problem) = feedback for Fixer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn ci_and_review(app: &App, sb: &Sandbox, job: &Job, repo: &Repo, sp: &str, base: &str, context: &str, explain: &str) -> Result<Option<String>, String> {
+    let id = job.id;
     if !repo.test_cmd.is_empty() {
         app.wait_unpaused().await;
         app.db.set_state(id, "ci", "running the full test suite");
@@ -464,13 +477,7 @@ async fn check_fix(app: &App, sb: &Sandbox, job: &Job, repo: &Repo, sp: &str, ba
     app.db.set_state(id, "review", "reviewing the change");
     app.set("reviewer", "WORKING", Some(id), Some(&format!("reviewing {}", label(job))));
     let diff = sb.ok(sp, &format!("git diff {}", q(&format!("{base}..HEAD"))), 60).await?;
-    let prompt = format!(
-        "{}\n\nAuthor's explanation:\nCause: {}\nFix: {}\n\n<diff>\n{}\n</diff>",
-        untrusted(job),
-        f["cause"].as_str().unwrap_or(""),
-        f["fix"].as_str().unwrap_or(""),
-        sh::head(&diff, 100_000)
-    );
+    let prompt = format!("{context}\n\nAuthor's explanation:\n{explain}\n\n<diff>\n{}\n</diff>", sh::head(&diff, 100_000));
     let r = llm::ask(app, Ask { agent: "reviewer", job: Some(id), system: prompts::REVIEWER, prompt, tools: None, resume: None, max_turns: 1, secs: 900 }).await?;
     involve(app, id, "reviewer");
     match r.json["ok"].as_bool() {
@@ -514,7 +521,7 @@ fn red_problem(tests: &[String], o: &sh::Out) -> Option<String> {
     None
 }
 
-fn green_problem(o: &sh::Out) -> Option<String> {
+pub(crate) fn green_problem(o: &sh::Out) -> Option<String> {
     (o.code != 0).then(|| format!("The regression test still fails with your fix (exit {}):\n{}", o.code, both(o)))
 }
 
@@ -526,7 +533,7 @@ async fn ready(app: &App, sb: &Sandbox, id: i64, repo: &Repo, sp: &str, base: &s
     let diff = sb.ok(sp, &format!("git diff {range}"), 60).await?;
     let files: Vec<String> = sb.ok(sp, &format!("git diff --name-only {range}"), 60).await?.lines().map(String::from).collect();
     let title = f["title"].as_str().unwrap_or(&job.title).to_string();
-    let body = pr_body(&job, &f, repo.auto);
+    let body = pr_body(&job, &f, repo.auto, &app.model("fixer"));
     app.db.update_data(id, |d| {
         d["diff"] = json!(sh::head(&diff, 200_000));
         d["files"] = json!(files);
@@ -544,7 +551,7 @@ async fn ready(app: &App, sb: &Sandbox, id: i64, repo: &Repo, sp: &str, base: &s
     Ok(())
 }
 
-fn pr_body(job: &Job, f: &Value, auto: bool) -> String {
+fn pr_body(job: &Job, f: &Value, auto: bool, model: &str) -> String {
     let p = &job.data["proof"];
     let tests = p["tests"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).map(|t| format!("`{t}`")).collect::<Vec<_>>().join(", ");
     let reference = match (job.issue, job.kind.as_str()) {
@@ -553,10 +560,11 @@ fn pr_body(job: &Job, f: &Value, auto: bool) -> String {
         _ => "Bug found and reported directly (no GitHub issue).".into(),
     };
     format!(
-        "{reference}\n\n## Cause\n{}\n\n## Fix\n{}\n\n## Proof\nRegression test {tests}, run with `{}`:\n- fails on the test commit, without the fix\n- passes on the fix commit\n\n---\n🤖 Generated with AI (Claude Code) by MyOffice{}.",
+        "{reference}\n\n## Cause\n{}\n\n## Fix\n{}\n\n## Proof\nRegression test {tests}, run with `{}`:\n- fails on the test commit, without the fix\n- passes on the fix commit\n\n---\n🤖 Generated with AI ({}) by MyOffice{}.",
         f["cause"].as_str().unwrap_or(""),
         f["fix"].as_str().unwrap_or(""),
         p["test_cmd"].as_str().unwrap_or(""),
+        model,
         if auto { "" } else { ", approved by a human before submitting" }
     )
 }
@@ -579,6 +587,11 @@ async fn submit(app: &App, lane: &Lane, job: &Job) -> Result<(), String> {
     sb.load(&sp, &m, &branch).await?;
     sb.ok(&sp, &format!("git checkout -q -f -B {} {} && git clean -fdq", q(&branch), q(&format!("origin/{branch}"))), 60).await?;
 
+    if issue_closed(app, job).await {
+        app.db.set_state(id, "dropped", "the issue was closed meanwhile (someone was faster)");
+        app.log("submit", Some(id), &format!("{} dropped: the issue was closed meanwhile", label(job)));
+        return Ok(());
+    }
     // Pre-push gate: if the default branch moved, rebase in the sandbox and prove it again.
     let tip = rev(sb, &sp, &format!("origin/{default}")).await?;
     if tip != base {
@@ -605,29 +618,11 @@ async fn submit(app: &App, lane: &Lane, job: &Job) -> Result<(), String> {
     // The commits leave the sandbox as a bundle (plain data) into the host mirror.
     sb.export(&sp, &m, &branch, &tip).await?;
 
-    let perm = sh::ok("gh", &["repo", "view", &job.repo, "--json", "viewerPermission", "-q", ".viewerPermission"], &app.data, 60).await?;
-    let can_write = matches!(perm.trim(), "ADMIN" | "MAINTAIN" | "WRITE");
-    let (url, head) = if can_write {
-        (format!("https://github.com/{}.git", job.repo), branch.clone())
-    } else {
-        let me = sh::ok("gh", &["api", "user", "-q", ".login"], &app.data, 60).await?.trim().to_string();
-        app.log("submit", Some(id), &format!("no write access to {}, pushing to your fork", job.repo));
-        let _ = sh::run("gh", &["repo", "fork", &job.repo, "--clone=false"], &app.data, 120).await; // fine if it already exists
-        // ponytail: assumes your fork has the same name as the original.
-        let name = job.repo.rsplit('/').next().unwrap_or("");
-        (format!("https://github.com/{me}/{name}.git"), format!("{me}:{branch}"))
-    };
-
-    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-    let mut pushed = Err(String::new());
-    for _ in 0..3 {
-        pushed = host_git(&m, &["push", "-f", "-q", &url, &refspec], 600).await;
-        if pushed.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(10)).await; // a fresh fork takes a moment
-    }
-    pushed?;
+    let (url, head, can_write) = push(app, job, &m, &branch, true).await?;
+    app.db.update_data(id, |d| {
+        d["push_url"] = json!(url);
+        d["head"] = json!(head);
+    });
 
     let body_file = crate::sandbox::tmp_file(&app.data, "md");
     std::fs::write(&body_file, s("pr_body")).map_err(|e| e.to_string())?;
@@ -642,6 +637,54 @@ async fn submit(app: &App, lane: &Lane, job: &Job) -> Result<(), String> {
     app.set("submit", "IDLE", None, Some(&format!("PR opened: {pr}")));
     app.log("submit", Some(id), &format!("PR opened: {pr}"));
     Ok(())
+}
+
+/// Pushes `branch` from the host mirror to the repo (or your fork without write access).
+/// Returns (push URL, PR head, can write). `force` only for a branch rewritten by a rebase.
+pub(crate) async fn push(app: &App, job: &Job, m: &Path, branch: &str, force: bool) -> Result<(String, String, bool), String> {
+    let perm = sh::ok("gh", &["repo", "view", &job.repo, "--json", "viewerPermission", "-q", ".viewerPermission"], &app.data, 60).await?;
+    let can_write = matches!(perm.trim(), "ADMIN" | "MAINTAIN" | "WRITE");
+    let (url, head) = if can_write {
+        (format!("https://github.com/{}.git", job.repo), branch.to_string())
+    } else {
+        let me = my_login(app).await?;
+        app.log("submit", Some(job.id), &format!("no write access to {}, pushing to your fork", job.repo));
+        let _ = sh::run("gh", &["repo", "fork", &job.repo, "--clone=false"], &app.data, 120).await; // fine if it already exists
+        // ponytail: assumes your fork has the same name as the original.
+        let name = job.repo.rsplit('/').next().unwrap_or("");
+        (format!("https://github.com/{me}/{name}.git"), format!("{me}:{branch}"))
+    };
+    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    let mut args = vec!["push", "-q"];
+    if force {
+        args.push("--force");
+    }
+    args.extend([url.as_str(), refspec.as_str()]);
+    let mut pushed = Err(String::new());
+    for _ in 0..3 {
+        pushed = host_git(m, &args, 600).await;
+        if pushed.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await; // a fresh fork takes a moment
+    }
+    pushed?;
+    Ok((url, head, can_write))
+}
+
+/// Your GitHub login (cached).
+pub(crate) async fn my_login(app: &App) -> Result<String, String> {
+    if let Some(l) = app.db.get("gh_login") {
+        return Ok(l);
+    }
+    let l = sh::ok("gh", &["api", "user", "-q", ".login"], &app.data, 60).await?.trim().to_string();
+    app.db.set("gh_login", &l);
+    Ok(l)
+}
+
+/// "Someone was faster": the issue got closed while we worked on it.
+pub(crate) async fn issue_closed(app: &App, job: &Job) -> bool {
+    job.issue > 0 && sh::ok("gh", &["issue", "view", &job.issue.to_string(), "-R", &job.repo, "--json", "state", "-q", ".state"], &app.data, 60).await.map(|s| s.trim() == "CLOSED").unwrap_or(false)
 }
 
 pub async fn merge(app: &App, job: &Job) -> Result<(), String> {
@@ -659,23 +702,6 @@ pub async fn merge(app: &App, job: &Job) -> Result<(), String> {
 }
 
 // ================================================================ Watcher, Test Agent
-
-pub async fn watch_loop(app: Arc<App>) {
-    loop {
-        tokio::time::sleep(Duration::from_secs(300)).await;
-        for j in app.db.open_prs() {
-            app.set("watcher", "WORKING", Some(j.id), Some(&format!("watching {}", label(&j))));
-            if let Ok(st) = sh::ok("gh", &["pr", "view", &j.pr_url, "--json", "state", "-q", ".state"], &app.data, 60).await {
-                let st = st.trim();
-                if !st.is_empty() && st != "OPEN" {
-                    app.db.set_pr(j.id, &j.pr_url, st);
-                    app.log("watcher", Some(j.id), &format!("{} is now {}", j.pr_url, st.to_lowercase()));
-                }
-            }
-        }
-        app.set("watcher", "IDLE", None, None);
-    }
-}
 
 pub async fn test_agent(app: &App, agent: &str) {
     let Some((id, _)) = crate::AGENTS.iter().find(|(a, _)| *a == agent) else { return };
