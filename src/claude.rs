@@ -1,5 +1,5 @@
-use crate::{sh, App};
-use serde_json::Value;
+use crate::{mcp, sandbox, sh, App};
+use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -10,9 +10,10 @@ pub struct Ask<'a> {
     pub job: Option<i64>,
     pub system: &'static str,
     pub prompt: String,
-    pub cwd: &'a Path,
-    /// Tools it may use in `cwd`: EDIT, READ, or "" for a text answer only.
-    pub tools: &'static str,
+    /// The sandbox space whose office tools it gets; None = text answer only, no tools.
+    pub space: Option<&'a str>,
+    /// Only read/grep/ls (Hunter).
+    pub readonly: bool,
     /// Continue an earlier conversation (Repro and Fixer keep their context between rounds).
     pub resume: Option<String>,
     pub max_turns: u32,
@@ -23,19 +24,6 @@ pub struct Reply {
     pub json: Value,
     pub session: String,
 }
-
-/// Read, change and run things in the repo (Repro, Fixer).
-pub const EDIT: &str = "Read,Edit,Write,Glob,Grep,Bash";
-/// Look only (Hunter).
-pub const READ: &str = "Read,Glob,Grep";
-// ponytail: Claude Code's permission rules are the only fence here, and Bash runs on your own PC.
-// Phase 5 of PLAN.md moves this into Docker; until then only add repos you trust.
-const DENY: &[&str] = &[
-    "Bash(git push:*)", "Bash(git remote:*)", "Bash(git config:*)", "Bash(gh:*)", "Bash(curl:*)", "Bash(wget:*)", "Bash(ssh:*)",
-    // No installing into your system: global packages outlive the job and change your PC.
-    "Bash(pip:*)", "Bash(pip3:*)", "Bash(py -m pip:*)", "Bash(py -3 -m pip:*)", "Bash(python -m pip:*)", "Bash(python3 -m pip:*)",
-    "Bash(npm install -g:*)", "Bash(npm i -g:*)", "Bash(cargo install:*)", "Bash(winget:*)", "Bash(choco:*)",
-];
 
 /// The real claude.exe. `claude` on PATH may be an older copy or a .cmd wrapper
 /// (Rust can't pass multi-line arguments through .cmd files).
@@ -53,31 +41,38 @@ fn claude_bin() -> String {
 }
 
 /// Runs `claude -p` with the agent's model and streams what it does to the dashboard.
+///
+/// Claude gets none of its built-in tools: only the office's MCP tools, which run inside the
+/// sandbox space. It runs in an empty folder, so there is nothing of yours for it to see.
 pub async fn ask(app: &App, a: Ask<'_>) -> Result<Reply, String> {
     let model = app.model(a.agent);
     let turns = a.max_turns.to_string();
     // --setting-sources= : load no settings files, so neither your hooks/plugins nor a cloned
     // repo's .claude/settings.json can run anything. Your login still works.
-    let mut args: Vec<&str> = vec!["-p", "--setting-sources=", "--output-format", "stream-json", "--verbose", "--model", &model, "--max-turns", &turns, "--append-system-prompt", a.system];
-    args.extend(["--tools", a.tools]);
-    if !a.tools.is_empty() {
-        args.extend(["--allowedTools", a.tools, "--disallowedTools"]);
-        args.extend(DENY.iter().copied());
+    let mut args: Vec<&str> = vec!["-p", "--setting-sources=", "--output-format", "stream-json", "--verbose", "--model", &model, "--max-turns", &turns, "--append-system-prompt", a.system, "--tools", ""];
+    let mut cfg = None;
+    if let Some(sp) = a.space {
+        let sb = app.sandbox().await;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let f = sandbox::tmp_file(&app.data, "json");
+        let server = json!({"type": "stdio", "command": exe.to_string_lossy(), "args": mcp::args(sb, sp, a.readonly)});
+        std::fs::write(&f, json!({"mcpServers": {"office": server}}).to_string()).map_err(|e| e.to_string())?;
+        cfg = Some(f);
+    }
+    let cfg_s = cfg.as_ref().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    if cfg.is_some() {
+        args.extend(["--mcp-config", &cfg_s, "--strict-mcp-config", "--allowedTools", "mcp__office"]);
     }
     if let Some(s) = &a.resume {
         args.extend(["--resume", s.as_str()]);
     }
     let bin = claude_bin();
-    // Its own temp folder for programs that read TEMP (Python tempfile, npm, ...).
-    // ponytail: Git Bash's /tmp ignores this and stays the Windows temp folder; Docker would close that.
-    let tmp = app.data.join("tmp").join(a.agent);
-    let _ = std::fs::create_dir_all(&tmp);
+    let empty = app.data.join("empty");
+    let _ = std::fs::create_dir_all(&empty);
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.args(&args)
-        .current_dir(a.cwd)
-        .env("TEMP", &tmp)
-        .env("TMP", &tmp)
-        .env("TMPDIR", &tmp)
+        .current_dir(&empty)
+        .env("MCP_TOOL_TIMEOUT", "3700000") // long test runs: up to the sh tool's 60 min
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -86,7 +81,17 @@ pub async fn ask(app: &App, a: Ask<'_>) -> Result<Reply, String> {
         .env_remove("CLAUDE_CODE_ENTRYPOINT");
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
-    let mut child = cmd.spawn().map_err(|e| format!("cannot start {bin}: {e}"))?;
+    let result = match cmd.spawn() {
+        Ok(child) => run(app, &a, child).await,
+        Err(e) => Err(format!("cannot start {bin}: {e}")),
+    };
+    if let Some(f) = cfg {
+        let _ = std::fs::remove_file(f);
+    }
+    result
+}
+
+async fn run(app: &App, a: &Ask<'_>, mut child: tokio::process::Child) -> Result<Reply, String> {
 
     // The prompt goes through stdin: issue texts can be longer than a command line allows.
     let mut stdin = child.stdin.take().unwrap();
@@ -135,7 +140,8 @@ pub async fn ask(app: &App, a: Ask<'_>) -> Result<Reply, String> {
 
     let r = result.ok_or_else(|| format!("claude ended without an answer: {}", sh::tail(&stderr, 400)))?;
     let u = &r["usage"];
-    let tok = ["input_tokens", "cache_creation_input_tokens", "output_tokens"].iter().map(|k| u[k].as_i64().unwrap_or(0)).sum();
+    // New input + output. Cache reads/writes are left out: they re-count the same context every turn.
+    let tok = ["input_tokens", "output_tokens"].iter().map(|k| u[k].as_i64().unwrap_or(0)).sum();
     app.db.add_tokens(a.agent, tok, r["total_cost_usd"].as_f64().unwrap_or(0.0));
     let text = r["result"].as_str().unwrap_or("");
     if r["is_error"].as_bool() == Some(true) {
@@ -144,11 +150,12 @@ pub async fn ask(app: &App, a: Ask<'_>) -> Result<Reply, String> {
     Ok(Reply { json: extract_json(text), session: r["session_id"].as_str().unwrap_or("").into() })
 }
 
-/// "Bash cargo test parse_empty" instead of a JSON blob.
+/// "sh npm test" instead of "mcp__office__sh {\"cmd\": ...}".
 fn tool_line(c: &Value) -> String {
     let i = &c["input"];
-    let arg = ["command", "file_path", "pattern", "path"].iter().find_map(|k| i[k].as_str()).map(String::from).unwrap_or_else(|| i.to_string());
-    format!("{} {}", c["name"].as_str().unwrap_or("?"), sh::head(&arg, 160))
+    let arg = ["cmd", "path", "pattern"].iter().find_map(|k| i[k].as_str()).map(String::from).unwrap_or_else(|| i.to_string());
+    let name = c["name"].as_str().unwrap_or("?");
+    format!("{} {}", name.strip_prefix("mcp__office__").unwrap_or(name), sh::head(&arg, 160))
 }
 
 /// Models sometimes wrap the JSON in prose or a code fence; take the outermost {...}.

@@ -117,6 +117,7 @@ async fn state(State(app): S) -> Json<Value> {
         "paused": app.paused(),
         "machine": machine,
         "counts": app.db.counts(),
+        "usd_today": app.db.usd_today(),
         "agents": agents,
         "jobs": app.db.jobs(200).iter().map(summary).collect::<Vec<_>>(),
         "events": app.db.events(200),

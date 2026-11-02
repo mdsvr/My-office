@@ -126,14 +126,16 @@ Your TSX gets split into these pieces as-is: same classes, same SVGs. Only the d
 `npm run build` → `web/dist`, embedded into the Rust binary, so you run a single `myoffice.exe`.
 During development: `npm run dev` (hot reload) proxies `/api` and `/events` to the Rust server.
 
-## 6. Build order
+## 6. Build order (all done)
 
-1. **Toolchain**: install Rust + VS C++ Build Tools (you run the commands, see README).
-2. **UI shell**: Vite project from your TSX, split into components, still on fake data. You see it in the browser.
-3. **Backend core**: server, DB, SSE, repos, manual "New Issue", Repro → Fixer → red/green proof → CI → Reviewer → approve → Submit.
-   Connect UI to `/api/state` + `/events`. **First real PR.**
-4. **Scout, Guard, Vet, Watcher, Merge button, model switching, Test Agent, token counts.**
-5. **Docker isolation** for Repro/Fixer/CI (the `local` stamp becomes `docker`).
-6. Optional: Hunter, cost tracking, notifications, autostart.
+1. ✅ **Toolchain**: Rust + VS C++ Build Tools.
+2. ✅ **UI shell**: Vite project from your TSX.
+3. ✅ **Backend core**: server, DB, SSE, repos, New Issue, Repro → Fixer → red/green proof → CI → Reviewer → approve → Submit.
+4. ✅ **Scout, Guard, Vet, Watcher, Merge, model switching, Test Agent, token counts.**
+5. ✅ **Docker sandbox** (`src/sandbox.rs`, `src/mcp.rs`): all repo work runs in the `myoffice-sandbox` container on its
+   own Docker volume. The host keeps a bare mirror per repo (fetch/push only); code moves in and out as git bundles.
+   Claude gets no built-in tools, only the office tools (read, write, edit, grep, ls, sh) running in the sandbox.
+   Without Docker the same design runs locally, with a blocklist on the sh tool.
+6. ✅ **Extras**: Hunter, cost per day, browser notifications, `myoffice autostart on|off`, MY OFFICE FM radio.
 
 Test target: a small repo of your own with planted bugs (like ApolloOffice's `ao-testbed`), so PRs don't go to strangers while testing.

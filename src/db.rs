@@ -256,6 +256,11 @@ impl Db {
         m
     }
 
+    /// What today's Claude runs would cost at API prices (on a subscription you don't pay this per run).
+    pub fn usd_today(&self) -> f64 {
+        self.c().query_row("select coalesce(sum(usd), 0) from tokens where day=?1", params![day()], |r| r.get(0)).unwrap_or(0.0)
+    }
+
     pub fn get(&self, k: &str) -> Option<String> {
         self.c().query_row("select v from settings where k=?1", params![k], |r| r.get(0)).optional().unwrap()
     }

@@ -30,7 +30,25 @@ Settings via environment variables: `MYOFFICE_PORT` (47400), `MYOFFICE_DATA` (`.
 
 UI development with hot reload: run the server, then `cd web && npm run dev` (it forwards `/api` and `/events`).
 
-## ⚠ Safety
+## Sandbox
 
-Until Docker isolation is added (PLAN.md step 5), Repro and Fixer run commands, and CI runs the repo's
-tests, **directly on this PC**. Only add repositories you trust.
+With Docker Desktop running, MY OFFICE builds a sandbox image on first start (about 2 minutes) and does all repo
+work in the `myoffice-sandbox` container: checkouts, the agents' tools, tests and CI. The container has its own
+volume, no access to your drives, and no GitHub or Claude credentials. Your PC only keeps a bare copy of each repo
+(`data/mirror`) to fetch from and push to GitHub. The header shows **docker sandbox** or **local**.
+
+Test commands run inside the sandbox, which is Linux: use `python3 -m pytest -q`, `npm test`, etc. (`py` also
+works there). Without Docker, or with `MYOFFICE_SANDBOX=local`, everything runs on this PC instead, and the agents'
+shell is limited: no pushing, no installs into the system, no paths outside the repo.
+
+## Start with Windows
+
+```sh
+cd F:\MyOffice
+target\release\myoffice.exe autostart on    # "off" to undo
+```
+
+## Safety
+
+Every pull request waits for your approval unless you turn on Auto-PR for a repo. In local mode (no Docker), only
+add repositories you trust.

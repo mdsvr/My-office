@@ -1,7 +1,9 @@
 mod claude;
 mod db;
+mod mcp;
 mod pipeline;
 mod prompts;
+mod sandbox;
 mod sh;
 mod web;
 
@@ -11,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, Notify, OnceCell};
 
 /// The 10 agents and their default model ("" = runs no model). Order matches the dashboard.
 pub const AGENTS: &[(&str, &str)] = &[
@@ -49,9 +51,23 @@ pub struct App {
     pub wake: Notify,
     /// Wakes the scout (repo added, issue added, "Run Full Pipeline").
     pub scan: Notify,
+    /// Where repo work runs; started on first use (building the Docker image can take minutes).
+    pub sb: OnceCell<sandbox::Sandbox>,
 }
 
 impl App {
+    pub async fn sandbox(&self) -> &sandbox::Sandbox {
+        self.sb
+            .get_or_init(|| async {
+                self.log("watcher", None, "starting the sandbox...");
+                let (sb, note) = sandbox::Sandbox::start(&self.data).await;
+                self.machine.lock().unwrap()["sandbox"] = json!(note);
+                self.log("watcher", None, &format!("sandbox ready: {note}"));
+                sb
+            })
+            .await
+    }
+
     /// Something an agent says: saved, shown in the LOG panel and in its speech bubble.
     pub fn log(&self, agent: &str, job: Option<i64>, msg: &str) {
         let msg = sh::head(msg.trim(), 500);
@@ -106,9 +122,24 @@ impl App {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => {}
+        // Started by Claude for each agent run; stdout is JSON-RPC only.
+        Some("mcp") => {
+            let o = mcp::parse(&args).ok_or_else(|| anyhow::anyhow!("usage: myoffice mcp --data D --space S --mode docker|local [--readonly]"))?;
+            mcp::serve(o).await;
+            return Ok(());
+        }
+        Some("autostart") => {
+            println!("{}", autostart(args.get(1).map(String::as_str) == Some("on"))?);
+            return Ok(());
+        }
+        Some(x) => anyhow::bail!("unknown command {x:?}. Run without arguments to start the office, or: myoffice autostart on|off"),
+    }
     let port: u16 = std::env::var("MYOFFICE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(47400);
     let data = std::env::var_os("MYOFFICE_DATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("data"));
-    std::fs::create_dir_all(data.join("work"))?;
+    std::fs::create_dir_all(&data)?;
     // Not canonicalize(): on Windows it adds a \\?\ prefix that git and gh don't handle well.
     let data = if data.is_absolute() { data } else { std::env::current_dir()?.join(data) };
     let db = db::Db::open(&data.join("office.db"))?;
@@ -124,14 +155,14 @@ async fn main() -> anyhow::Result<()> {
         "name": std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "ME".into()),
         "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
         "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
-        "docker": Value::Null,
+        "sandbox": "starting...",
     });
-    let app = Arc::new(App { db, data, port, tx, live: Mutex::new(live), machine: Mutex::new(machine), wake: Notify::new(), scan: Notify::new() });
+    let app = Arc::new(App { db, data, port, tx, live: Mutex::new(live), machine: Mutex::new(machine), wake: Notify::new(), scan: Notify::new(), sb: OnceCell::new() });
 
     let a = app.clone();
     tokio::spawn(async move {
-        let o = sh::run("docker", &["info", "--format", "{{.ServerVersion}}"], &a.data, 30).await;
-        a.machine.lock().unwrap()["docker"] = if o.code == 0 { json!(o.out.trim()) } else { json!(false) };
+        a.sandbox().await;
+        a.changed();
     });
     tokio::spawn(pipeline::scout_loop(app.clone()));
     tokio::spawn(pipeline::run_loop(app.clone()));
@@ -142,4 +173,17 @@ async fn main() -> anyhow::Result<()> {
     println!("\n  MY OFFICE is running: http://127.0.0.1:{port}\n  data: {}\n  stop with Ctrl+C\n", app.data.display());
     axum::serve(listener, web::router(app)).await?;
     Ok(())
+}
+
+/// `myoffice autostart on|off`: start MY OFFICE (from the current folder) when you log in to Windows.
+fn autostart(on: bool) -> anyhow::Result<String> {
+    let appdata = std::env::var("APPDATA").map_err(|_| anyhow::anyhow!("autostart is only supported on Windows"))?;
+    let f = PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Startup\MyOffice.cmd");
+    if !on {
+        let _ = std::fs::remove_file(&f);
+        return Ok(format!("autostart off (removed {})", f.display()));
+    }
+    let (exe, dir) = (std::env::current_exe()?, std::env::current_dir()?);
+    std::fs::write(&f, format!("@echo off\r\ncd /d \"{}\"\r\nstart \"MY OFFICE\" /min \"{}\"\r\n", dir.display(), exe.display()))?;
+    Ok(format!("autostart on: MY OFFICE starts from {} when you log in ({})", dir.display(), f.display()))
 }

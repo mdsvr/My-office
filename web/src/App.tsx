@@ -806,6 +806,7 @@ export default function App() {
   });
   useEffect(() => {
     try { localStorage.setItem('myoffice-theme', themeMode); } catch {}
+    document.documentElement.style.filter = themeMode === 'shonen' ? 'grayscale(1) contrast(1.1)' : '';
   }, [themeMode]);
   const radio = useRadio();
   const [showTuner, setShowTuner] = useState(false);
@@ -855,13 +856,33 @@ export default function App() {
   const logs = [
     ...office.events.map((e) => {
       const a = agentById(e.agent);
-      return { t: e.t, time: fmtTime(e.t), agent: a ? a.name[0] + a.name.slice(1).toLowerCase() : e.agent, color: a?.darkColor || '#71717a', text: e.msg };
+      return { t: e.t, time: fmtTime(e.t), agent: a ? a.name[0] + a.name.slice(1).toLowerCase() : e.agent, color: (themeMode === 'midnight' ? a?.color : a?.darkColor) || '#71717a', text: e.msg };
     }),
     ...localLogs
   ].sort((x, y) => y.t - x.t);
 
   const selectedAgent = agents.find((a) => a.id === selectedAgentId) || agents[0];
   const highlightedPr = prs.find((p) => p.id === highlightedPrId);
+
+  const sandboxNote = String(office.machine.sandbox || 'starting...');
+  const inDocker = sandboxNote.startsWith('docker');
+
+  // Desktop notifications when a fix needs you or a PR opens (only while this tab is in the background).
+  const seenJobs = useRef(null);
+  useEffect(() => {
+    const now = new Map(jobs.map((j) => [j.id, j.state + '|' + (j.pr_url || '')]));
+    const before = seenJobs.current;
+    seenJobs.current = now;
+    if (!before || typeof Notification === 'undefined' || Notification.permission !== 'granted' || !document.hidden) return;
+    for (const j of jobs) {
+      const was = before.get(j.id) || '';
+      if (j.state === 'approve' && !was.startsWith('approve|')) new Notification('MY OFFICE: fix ready for you', { body: `${j.label}: ${j.pr_title || j.title}` });
+      if (j.pr_url && !was.endsWith(j.pr_url)) new Notification('MY OFFICE: PR opened', { body: `${j.label}: ${j.pr_url}` });
+    }
+  }, [jobs]);
+  const askNotify = () => {
+    try { if (typeof Notification !== 'undefined' && Notification.permission === 'default') Notification.requestPermission(); } catch {}
+  };
 
   const openPrCount = prs.filter((p) => p.status === 'OPEN').length;
   const mergedPrCount = prs.filter((p) => p.status === 'MERGED').length;
@@ -896,7 +917,10 @@ export default function App() {
   };
 
   // "Run Full Pipeline": Scout checks every repository now.
-  const startBugHuntSimulation = () => api('/api/scan');
+  const startBugHuntSimulation = () => {
+    askNotify();
+    return api('/api/scan');
+  };
 
   const dispatchNewIssue = () =>
     api('/api/issue', { repo: newBugRepo || office.repos[0]?.full || '', text: customBugTitle.trim() });
@@ -947,7 +971,7 @@ export default function App() {
 
   return (
     <div 
-      className={`min-h-screen w-full ${theme.pageBg} font-sans transition-colors duration-300 pb-8 select-none`}
+      className={`theme-${themeMode} min-h-screen w-full ${theme.pageBg} font-sans transition-colors duration-300 pb-8 select-none`}
       style={{
         backgroundImage: `radial-gradient(${theme.dotColor} 1.25px, transparent 1.25px)`,
         backgroundSize: '12px 12px'
@@ -965,6 +989,12 @@ export default function App() {
         .manga-panel {
           border: 3px solid #1a1a1a;
           box-shadow: 4px 4px 0px #1a1a1a;
+        }
+        .theme-midnight .manga-panel,
+        .theme-midnight .manga-card,
+        .theme-midnight .manga-btn {
+          border-color: #4b5061;
+          box-shadow: 3px 3px 0px #000;
         }
         .manga-card {
           border: 2.5px solid #1a1a1a;
@@ -1021,7 +1051,7 @@ export default function App() {
 
           {/* Local Stamp */}
           <span className="px-2.5 py-0.5 rounded-full text-xs font-bold border-2 border-[#1a1a1a] bg-amber-100 text-[#1a1a1a] shadow-[2px_2px_0px_#1a1a1a]">
-            local
+            {inDocker ? 'docker sandbox' : 'local'}
           </span>
 
           {/* Pipeline Counter Strip */}
@@ -1126,7 +1156,9 @@ export default function App() {
                   isWorking
                     ? 'bg-yellow-100 text-[#1a1a1a] -translate-y-0.5 ring-2 ring-rose-500'
                     : isSelected
-                    ? 'bg-pink-50 text-[#1a1a1a] -translate-y-0.5'
+                    ? themeMode === 'midnight'
+                      ? 'bg-pink-950/70 text-pink-50 -translate-y-0.5 ring-2 ring-pink-400'
+                      : 'bg-pink-50 text-[#1a1a1a] -translate-y-0.5'
                     : `${theme.cardBg}`
                 }`}
               >
@@ -1459,7 +1491,7 @@ export default function App() {
                               <div className="bg-emerald-500 h-full w-1/3" />
                             </div>
                             <div className="text-[9px] font-mono opacity-75">
-                              {office.machine.cpus || "?"} CPUs · {office.machine.docker ? "docker" : "local, no sandbox"}
+                              {office.machine.cpus || "?"} CPUs · {inDocker ? "docker sandbox" : "local, no sandbox"}
                             </div>
                           </div>
                         </div>
@@ -1933,7 +1965,7 @@ export default function App() {
                   <input
                     value={repoForm.test_cmd}
                     onChange={(e) => setRepoForm({ ...repoForm, test_cmd: e.target.value })}
-                    placeholder="full test command, e.g. pytest -q  or  cargo test"
+                    placeholder={inDocker ? 'full test command (runs in the Linux sandbox), e.g. python3 -m pytest -q' : 'full test command, e.g. py -m pytest -q  or  npm test'}
                     className="w-full px-3 py-1.5 rounded-lg border-2 border-[#1a1a1a] bg-white font-mono text-xs focus:outline-none focus:ring-2 focus:ring-pink-400"
                   />
                   <label className="flex items-center gap-2 text-[11px] font-bold">
@@ -1964,10 +1996,13 @@ export default function App() {
                     <span className="px-1.5 py-0.5 bg-emerald-300 border border-[#1a1a1a] rounded text-[10px]">{office.online ? 'ONLINE' : 'OFFLINE'}</span>
                   </div>
                   <div className="font-mono text-[11px] opacity-80">
-                    OS: {office.machine.os} · CPUs: {office.machine.cpus} · Docker: {office.machine.docker ? `yes (${office.machine.docker})` : 'not running'}
+                    OS: {office.machine.os} · CPUs: {office.machine.cpus}
                   </div>
                   <div className="font-mono text-[11px] opacity-80">
-                    Sandbox: none yet, agents run on this PC · Tokens today: {Object.values(office.agents).reduce((n: number, a: any) => n + (a.tokens || 0), 0) as number}k tok
+                    Sandbox: {sandboxNote}{inDocker ? ' (container myoffice-sandbox: agents and tests cannot see your files)' : ' (agents and tests run on this PC)'}
+                  </div>
+                  <div className="font-mono text-[11px] opacity-80">
+                    Today: {Object.values(office.agents).reduce((n: number, a: any) => n + (a.tokens || 0), 0) as number}k tokens · ${Number(office.usd_today || 0).toFixed(2)} at API prices (on a Claude subscription you don't pay this per run)
                   </div>
                 </div>
               </div>

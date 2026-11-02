@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 pub struct Out {
     pub code: i32,
@@ -8,27 +9,46 @@ pub struct Out {
     pub err: String,
 }
 
-/// Runs a program and waits for it. Exit code -1 means it could not start or timed out.
-pub async fn run(prog: &str, args: &[&str], cwd: &Path, secs: u64) -> Out {
+/// Raw output, for binary data such as git bundles.
+pub struct Raw {
+    pub code: i32,
+    pub out: Vec<u8>,
+    pub err: String,
+}
+
+/// Runs a program, optionally feeding it bytes on stdin. Exit code -1 = could not start or timed out.
+pub async fn run_raw(prog: &str, args: &[&str], cwd: &Path, input: Option<Vec<u8>>, secs: u64) -> Raw {
     let mut c = tokio::process::Command::new(prog);
-    c.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    c.args(args)
+        .current_dir(cwd)
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     #[cfg(windows)]
     c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    let child = match c.spawn() {
+    let mut child = match c.spawn() {
         Ok(c) => c,
-        Err(e) => return Out { code: -1, out: String::new(), err: format!("cannot start {prog}: {e}") },
+        Err(e) => return Raw { code: -1, out: vec![], err: format!("cannot start {prog}: {e}") },
     };
-    // ponytail: kill_on_drop stops the direct child only; grandchildren (e.g. cargo under bash)
-    // can outlive a timeout on Windows. Use a Job Object or Docker if that bites.
-    match tokio::time::timeout(Duration::from_secs(secs), child.wait_with_output()).await {
-        Ok(Ok(o)) => Out {
-            code: o.status.code().unwrap_or(-1),
-            out: String::from_utf8_lossy(&o.stdout).into_owned(),
-            err: String::from_utf8_lossy(&o.stderr).into_owned(),
-        },
-        Ok(Err(e)) => Out { code: -1, out: String::new(), err: e.to_string() },
-        Err(_) => Out { code: -1, out: String::new(), err: format!("timed out after {secs}s") },
+    if let Some(bytes) = input {
+        let mut stdin = child.stdin.take().unwrap();
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&bytes).await;
+        });
     }
+    // ponytail: kill_on_drop stops the direct child only; in local mode grandchildren can outlive
+    // a timeout on Windows. Docker mode wraps commands in `timeout` inside the container.
+    match tokio::time::timeout(Duration::from_secs(secs), child.wait_with_output()).await {
+        Ok(Ok(o)) => Raw { code: o.status.code().unwrap_or(-1), out: o.stdout, err: String::from_utf8_lossy(&o.stderr).into_owned() },
+        Ok(Err(e)) => Raw { code: -1, out: vec![], err: e.to_string() },
+        Err(_) => Raw { code: -1, out: vec![], err: format!("timed out after {secs}s") },
+    }
+}
+
+pub async fn run(prog: &str, args: &[&str], cwd: &Path, secs: u64) -> Out {
+    let r = run_raw(prog, args, cwd, None, secs).await;
+    Out { code: r.code, out: String::from_utf8_lossy(&r.out).into_owned(), err: r.err }
 }
 
 /// Like `run`, but returns stdout on success and a readable error otherwise.
@@ -41,13 +61,8 @@ pub async fn ok(prog: &str, args: &[&str], cwd: &Path, secs: u64) -> Result<Stri
     }
 }
 
-/// Runs a shell script with stdout and stderr merged in order.
-pub async fn bash(script: &str, cwd: &Path, secs: u64) -> Out {
-    run(&bash_path(), &["-c", &format!("{{ {script}\n}} 2>&1")], cwd, secs).await
-}
-
 /// On Windows, plain `bash` may be WSL's, so prefer Git Bash.
-fn bash_path() -> String {
+pub fn bash_path() -> String {
     if let Ok(b) = std::env::var("MYOFFICE_BASH") {
         return b;
     }
@@ -57,6 +72,11 @@ fn bash_path() -> String {
     } else {
         "bash".into()
     }
+}
+
+/// Single-quotes a value for bash.
+pub fn q(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 pub fn head(s: &str, n: usize) -> String {
