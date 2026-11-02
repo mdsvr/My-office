@@ -2,7 +2,8 @@
 //! Scout → Guard → Vet pick issues; Repro writes a failing test; Fixer writes the fix;
 //! CI runs the suite; Reviewer reads the diff; you approve; Submit opens the PR; Watcher follows it.
 
-use crate::claude::{self, Ask};
+use crate::llm::{self, Ask};
+use crate::tools::Toolbox;
 use crate::db::{Job, Repo};
 use crate::sandbox::{space, Mode, Sandbox};
 use crate::sh::q;
@@ -94,7 +95,7 @@ async fn scout(app: &App) -> Result<(), String> {
                 .map(|i| format!("<untrusted-issue number=\"{}\">\n{}\n\n{}\n</untrusted-issue>", i["number"], i["title"].as_str().unwrap_or(""), sh::head(i["body"].as_str().unwrap_or(""), 3000)))
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            let reply = claude::ask(app, Ask { agent: "scout", job: None, system: prompts::SCOUT, prompt, space: None, readonly: false, resume: None, max_turns: 1, secs: 300 }).await?;
+            let reply = llm::ask(app, Ask { agent: "scout", job: None, system: prompts::SCOUT, prompt, tools: None, resume: None, max_turns: 1, secs: 300 }).await?;
             for i in chunk {
                 let n = i["number"].as_i64().unwrap_or(0);
                 let v = &reply.json[n.to_string()];
@@ -117,7 +118,7 @@ async fn vet_all(app: &App) -> Result<(), String> {
         let issue = untrusted(&j);
 
         app.set("guard", "WORKING", Some(id), Some(&format!("checking {tag}")));
-        let g = claude::ask(app, Ask { agent: "guard", job: Some(id), system: prompts::GUARD, prompt: issue.clone(), space: None, readonly: false, resume: None, max_turns: 1, secs: 300 }).await?;
+        let g = llm::ask(app, Ask { agent: "guard", job: Some(id), system: prompts::GUARD, prompt: issue.clone(), tools: None, resume: None, max_turns: 1, secs: 300 }).await?;
         app.set("guard", "IDLE", None, Some("—"));
         involve(app, id, "guard");
         if g.json["injection"].as_bool() != Some(false) {
@@ -136,7 +137,7 @@ async fn vet_all(app: &App) -> Result<(), String> {
         app.set("vet", "WORKING", Some(id), Some(&format!("vetting {tag}")));
         let prs = sh::ok("gh", &["pr", "list", "-R", &j.repo, "--state", "open", "--limit", "50", "--json", "number,title"], &app.data, 60).await.unwrap_or_default();
         let prompt = format!("Repository {}.\n\n{issue}\n\nOpen pull requests (number, title):\n{}", j.repo, sh::head(&prs, 6000));
-        let v = claude::ask(app, Ask { agent: "vet", job: Some(id), system: prompts::VET, prompt, space: None, readonly: false, resume: None, max_turns: 1, secs: 300 }).await?;
+        let v = llm::ask(app, Ask { agent: "vet", job: Some(id), system: prompts::VET, prompt, tools: None, resume: None, max_turns: 1, secs: 300 }).await?;
         app.set("vet", "IDLE", None, Some("—"));
         involve(app, id, "vet");
         let why = v.json["why"].as_str().unwrap_or("no verdict").to_string();
@@ -221,7 +222,7 @@ async fn hunt_all(app: &App) -> Result<(), String> {
         sb.ok(&sp, &format!("git checkout -q -f --detach {} && git clean -fdq", q(&format!("origin/{default}"))), 120).await?;
         let known: Vec<String> = app.db.jobs(200).into_iter().filter(|j| j.repo == r.full).map(|j| j.title).collect();
         let prompt = format!("Repository: {}\n\nBugs already known (don't report these again):\n{}", r.full, sh::head(&known.join("\n"), 4000));
-        let reply = claude::ask(app, Ask { agent: "hunter", job: None, system: prompts::HUNTER, prompt, space: Some(&sp), readonly: true, resume: None, max_turns: 60, secs: 1800 }).await?;
+        let reply = llm::ask(app, Ask { agent: "hunter", job: None, system: prompts::HUNTER, prompt, tools: Some(Toolbox { sb: sb.clone(), space: sp.clone(), readonly: true }), resume: None, max_turns: 60, secs: 1800 }).await?;
         app.db.set(&key, &crate::db::now().to_string());
         let bugs = reply.json["bugs"].as_array().cloned().unwrap_or_default();
         for b in bugs.iter().take(3) {
@@ -332,7 +333,7 @@ async fn repro(app: &App, id: i64, tag: &str, sp: &str, base: &str, context: &st
     for attempt in 1..=REPRO_TRIES {
         app.db.set_state(id, "repro", &format!("writing a failing test (try {attempt})"));
         app.set("repro", "WORKING", Some(id), Some(&format!("sketching test for {tag}")));
-        let reply = claude::ask(app, Ask { agent: "repro", job: Some(id), system: prompts::REPRO, prompt: prompt.clone(), space: Some(sp), readonly: false, resume: session.clone(), max_turns: 80, secs: 2400 }).await?;
+        let reply = llm::ask(app, Ask { agent: "repro", job: Some(id), system: prompts::REPRO, prompt: prompt.clone(), tools: Some(Toolbox { sb: app.sandbox().await.clone(), space: sp.to_string(), readonly: false }), resume: session.clone(), max_turns: 80, secs: 2400 }).await?;
         if !reply.session.is_empty() {
             session = Some(reply.session);
         }
@@ -400,7 +401,7 @@ async fn fix_rounds(app: &App, job: &Job, repo: &Repo, sp: &str, base: &str, con
         app.wait_unpaused().await;
         app.db.set_state(id, "fix", &format!("round {round} of {FIX_ROUNDS}"));
         app.set("fixer", "WORKING", Some(id), Some(&format!("patching {tag}...")));
-        let reply = claude::ask(app, Ask { agent: "fixer", job: Some(id), system: prompts::FIXER, prompt: prompt.clone(), space: Some(sp), readonly: false, resume: session.clone(), max_turns: 100, secs: 3600 }).await?;
+        let reply = llm::ask(app, Ask { agent: "fixer", job: Some(id), system: prompts::FIXER, prompt: prompt.clone(), tools: Some(Toolbox { sb: app.sandbox().await.clone(), space: sp.to_string(), readonly: false }), resume: session.clone(), max_turns: 100, secs: 3600 }).await?;
         if !reply.session.is_empty() {
             session = Some(reply.session);
         }
@@ -478,7 +479,7 @@ async fn check_fix(app: &App, job: &Job, repo: &Repo, sp: &str, base: &str, proo
         f["fix"].as_str().unwrap_or(""),
         sh::head(&diff, 100_000)
     );
-    let r = claude::ask(app, Ask { agent: "reviewer", job: Some(id), system: prompts::REVIEWER, prompt, space: None, readonly: false, resume: None, max_turns: 1, secs: 900 }).await?;
+    let r = llm::ask(app, Ask { agent: "reviewer", job: Some(id), system: prompts::REVIEWER, prompt, tools: None, resume: None, max_turns: 1, secs: 900 }).await?;
     involve(app, id, "reviewer");
     match r.json["ok"].as_bool() {
         Some(true) => {
@@ -684,7 +685,7 @@ pub async fn test_agent(app: &App, agent: &str) {
     let Some((id, _)) = crate::AGENTS.iter().find(|(a, _)| *a == agent) else { return };
     app.set(id, "WORKING", None, None);
     let t = Instant::now();
-    let r = claude::ask(app, Ask { agent: id, job: None, system: "Answer only with JSON.", prompt: r#"Reply with exactly {"ok": true}"#.into(), space: None, readonly: false, resume: None, max_turns: 1, secs: 120 }).await;
+    let r = llm::ask(app, Ask { agent: id, job: None, system: "Answer only with JSON.", prompt: r#"Reply with exactly {"ok": true}"#.into(), tools: None, resume: None, max_turns: 1, secs: 120 }).await;
     let msg = match r {
         Ok(r) if r.json["ok"] == true => format!("test ok: {} answered in {:.1}s", app.model(id), t.elapsed().as_secs_f32()),
         Ok(_) => "test: answered, but not with the expected JSON".into(),

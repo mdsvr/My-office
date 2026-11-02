@@ -10,6 +10,10 @@ pub fn now() -> i64 {
 }
 
 /// Days since 1970 (UTC). Used as the key for "tokens today".
+pub fn now_ms() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
+}
+
 pub fn day() -> i64 {
     now() / 86_400
 }

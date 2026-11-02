@@ -1,10 +1,12 @@
 mod claude;
 mod db;
+mod llm;
 mod mcp;
 mod pipeline;
 mod prompts;
 mod sandbox;
 mod sh;
+mod tools;
 mod web;
 
 use serde::Serialize;
@@ -17,15 +19,15 @@ use tokio::sync::{broadcast, Notify, OnceCell};
 
 /// The 10 agents and their default model ("" = runs no model). Order matches the dashboard.
 pub const AGENTS: &[(&str, &str)] = &[
-    ("scout", "haiku"),
-    ("guard", "haiku"),
-    ("vet", "haiku"),
+    ("scout", "claude:haiku"),
+    ("guard", "claude:haiku"),
+    ("vet", "claude:haiku"),
     ("watcher", ""),
-    ("hunter", "sonnet"),
-    ("repro", "sonnet"),
-    ("fixer", "sonnet"),
+    ("hunter", "claude:sonnet"),
+    ("repro", "claude:sonnet"),
+    ("fixer", "claude:sonnet"),
     ("ci", ""),
-    ("reviewer", "opus"),
+    ("reviewer", "claude:opus"),
     ("submit", ""),
 ];
 
@@ -56,6 +58,25 @@ pub struct App {
 }
 
 impl App {
+    pub fn new(data: PathBuf, port: u16) -> anyhow::Result<App> {
+        let db = db::Db::open(&data.join("office.db"))?;
+        let (tx, _) = broadcast::channel(1024);
+        let live = AGENTS
+            .iter()
+            .map(|(a, _)| {
+                let status = if *a == "hunter" { "OFF" } else { "IDLE" };
+                (*a, Live { status: status.into(), job: None, task: "—".into(), speech: String::new(), tool: String::new() })
+            })
+            .collect();
+        let machine = json!({
+            "name": std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "ME".into()),
+            "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+            "sandbox": "starting...",
+        });
+        Ok(App { db, data, port, tx, live: Mutex::new(live), machine: Mutex::new(machine), wake: Notify::new(), scan: Notify::new(), sb: OnceCell::new() })
+    }
+
     pub async fn sandbox(&self) -> &sandbox::Sandbox {
         self.sb
             .get_or_init(|| async {
@@ -114,7 +135,26 @@ impl App {
         }
     }
 
-    /// Model alias for an agent: your choice from the dashboard, else the default.
+    /// Daily budget in USD (0 = none). When today's cost reaches it, AI calls wait until
+    /// tomorrow or until you raise the budget; nothing is dropped.
+    pub async fn wait_budget(&self) {
+        let mut told = false;
+        loop {
+            let budget: f64 = self.db.get("budget_usd").and_then(|b| b.parse().ok()).unwrap_or(0.0);
+            let spent = self.db.usd_today();
+            if budget <= 0.0 || spent < budget {
+                return;
+            }
+            if !told {
+                self.log("watcher", None, &format!("daily budget reached (${spent:.2} of ${budget:.2}): waiting until tomorrow or a higher budget"));
+                self.changed();
+                told = true;
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    }
+
+    /// "provider:model" for an agent: your choice from the dashboard, else the default.
     pub fn model(&self, agent: &str) -> String {
         self.db.get(&format!("model:{agent}")).unwrap_or_else(|| AGENTS.iter().find(|(a, _)| *a == agent).map(|(_, m)| m.to_string()).unwrap_or_default())
     }
@@ -142,22 +182,7 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&data)?;
     // Not canonicalize(): on Windows it adds a \\?\ prefix that git and gh don't handle well.
     let data = if data.is_absolute() { data } else { std::env::current_dir()?.join(data) };
-    let db = db::Db::open(&data.join("office.db"))?;
-    let (tx, _) = broadcast::channel(1024);
-    let live = AGENTS
-        .iter()
-        .map(|(a, _)| {
-            let status = if *a == "hunter" { "OFF" } else { "IDLE" };
-            (*a, Live { status: status.into(), job: None, task: "—".into(), speech: String::new(), tool: String::new() })
-        })
-        .collect();
-    let machine = json!({
-        "name": std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "ME".into()),
-        "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
-        "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
-        "sandbox": "starting...",
-    });
-    let app = Arc::new(App { db, data, port, tx, live: Mutex::new(live), machine: Mutex::new(machine), wake: Notify::new(), scan: Notify::new(), sb: OnceCell::new() });
+    let app = Arc::new(App::new(data, port)?);
 
     let a = app.clone();
     tokio::spawn(async move {

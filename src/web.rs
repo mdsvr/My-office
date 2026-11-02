@@ -1,5 +1,5 @@
 use crate::db::{Job, Repo};
-use crate::{pipeline, App, AGENTS};
+use crate::{llm, pipeline, App, AGENTS};
 use axum::extract::{Query, Request, State};
 use axum::http::{header, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -35,6 +35,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/job/action", post(job_action))
         .route("/api/pr/merge", post(merge))
         .route("/api/agent/model", post(set_model))
+        .route("/api/providers", get(providers))
+        .route("/api/models", get(models))
+        .route("/api/provider", post(save_provider))
         .route("/api/agent/test", post(test_agent))
         .route("/api/office/pause", post(pause))
         .fallback(get(static_file))
@@ -82,10 +85,16 @@ fn err(m: impl Into<String>) -> Json<Value> {
     Json(json!({"error": m.into()}))
 }
 
-fn model_label(m: &str) -> String {
-    match m {
-        "" => "no model".into(),
-        m => m[..1].to_uppercase() + &m[1..],
+/// "Sonnet" for Claude, "ollama · qwen2.5:3b" for everything else.
+fn model_label(spec: &str) -> String {
+    if spec.is_empty() {
+        return "no model".into();
+    }
+    let (p, m) = llm::split(spec);
+    if p.id == "claude" && !m.is_empty() {
+        m[..1].to_uppercase() + &m[1..]
+    } else {
+        format!("{} · {m}", p.id)
     }
 }
 
@@ -109,7 +118,7 @@ async fn state(State(app): S) -> Json<Value> {
         .map(|(id, _)| {
             let l = &live[id];
             let tok = tokens.get(*id).and_then(Value::as_i64).unwrap_or(0);
-            (id.to_string(), json!({"status": l.status, "job": l.job, "task": l.task, "speech": l.speech, "tool": l.tool, "tokens": (tok + 500) / 1000, "model": model_label(&app.model(id))}))
+            (id.to_string(), json!({"status": l.status, "job": l.job, "task": l.task, "speech": l.speech, "tool": l.tool, "tokens": (tok + 500) / 1000, "model": model_label(&app.model(id)), "spec": app.model(id)}))
         })
         .collect();
     let machine = app.machine.lock().unwrap().clone();
@@ -223,13 +232,16 @@ async fn merge(State(app): S, Json(b): Json<Value>) -> Json<Value> {
 
 async fn set_model(State(app): S, Json(b): Json<Value>) -> Json<Value> {
     let agent = b["agent"].as_str().unwrap_or("");
-    let model = b["model"].as_str().unwrap_or("").to_lowercase();
+    let model = b["model"].as_str().unwrap_or("").trim().to_string();
     let Some((_, default)) = AGENTS.iter().find(|(a, _)| *a == agent) else { return err("unknown agent") };
     if default.is_empty() {
         return err("this agent runs no model");
     }
-    if !matches!(model.as_str(), "haiku" | "sonnet" | "opus") {
-        return err("pick Haiku, Sonnet or Opus");
+    // "provider:model"; a bare Haiku/Sonnet/Opus means Claude.
+    let model = if model.contains(':') { model } else { format!("claude:{}", model.to_lowercase()) };
+    let (p, m) = llm::split(&model);
+    if m.is_empty() || !model.starts_with(&format!("{}:", p.id)) {
+        return err("pick a provider and a model");
     }
     app.db.set(&format!("model:{agent}"), &model);
     app.log(agent, None, &format!("switched model to {}", model_label(&model)));
@@ -250,6 +262,52 @@ async fn pause(State(app): S, Json(b): Json<Value>) -> Json<Value> {
     let p = b["paused"].as_bool().unwrap_or(false);
     app.db.set("paused", if p { "1" } else { "0" });
     app.log("watcher", None, if p { "office paused: finishing the current step, then waiting" } else { "office resumed" });
+    app.changed();
+    ok()
+}
+
+// ---------------------------------------------------------------- AI providers
+
+async fn providers(State(app): S) -> Json<Value> {
+    Json(json!(llm::PROVIDERS
+        .iter()
+        .map(|p| json!({
+            "id": p.id, "name": p.name, "local": p.local, "cli": p.kind == llm::Kind::ClaudeCli,
+            "base": llm::base_url(&app, p), "key_env": p.key_env,
+            // Never the key itself: only whether one is there.
+            "has_key": llm::key(p).is_some(),
+            "price": app.db.get(&format!("price:{}", p.id)).unwrap_or_default(),
+        }))
+        .collect::<Vec<_>>()))
+}
+
+async fn models(State(app): S, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
+    let Some(p) = llm::provider(q.get("provider").map(String::as_str).unwrap_or("")) else { return err("unknown provider") };
+    match llm::models(&app, p).await {
+        Ok(m) => Json(json!(m)),
+        Err(e) => err(e),
+    }
+}
+
+/// Address, API key (to Windows Credential Manager) and optional price of a provider.
+async fn save_provider(State(app): S, Json(b): Json<Value>) -> Json<Value> {
+    let Some(p) = llm::provider(b["id"].as_str().unwrap_or("")) else { return err("unknown provider") };
+    if let Some(base) = b["base"].as_str() {
+        let base = base.trim();
+        if !base.is_empty() && !(base.starts_with("http://") || base.starts_with("https://")) {
+            return err("the address must start with http:// or https://");
+        }
+        app.db.set(&format!("base:{}", p.id), base);
+    }
+    if let Some(k) = b["key"].as_str() {
+        if let Err(e) = llm::set_key(p, k.trim()) {
+            return err(format!("could not store the key in Windows Credential Manager: {e}"));
+        }
+    }
+    if let Some(pr) = b["price"].as_str() {
+        app.db.set(&format!("price:{}", p.id), pr.trim());
+    }
+    app.log("watcher", None, &format!("provider {} updated", p.name));
     app.changed();
     ok()
 }

@@ -1,29 +1,14 @@
+//! Claude Code CLI backend (your Claude login). Claude gets none of its built-in tools: only the
+//! office tools over MCP (mcp.rs), which run in the sandbox. It runs in an empty folder with no
+//! settings files and no account connectors, so there is nothing of yours for it to see.
+
+use crate::llm::{extract_json, tool_line, Ask, Reply};
 use crate::{mcp, sandbox, sh, App};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-
-pub struct Ask<'a> {
-    pub agent: &'static str,
-    pub job: Option<i64>,
-    pub system: &'static str,
-    pub prompt: String,
-    /// The sandbox space whose office tools it gets; None = text answer only, no tools.
-    pub space: Option<&'a str>,
-    /// Only read/grep/ls (Hunter).
-    pub readonly: bool,
-    /// Continue an earlier conversation (Repro and Fixer keep their context between rounds).
-    pub resume: Option<String>,
-    pub max_turns: u32,
-    pub secs: u64,
-}
-
-pub struct Reply {
-    pub json: Value,
-    pub session: String,
-}
 
 /// The real claude.exe. `claude` on PATH may be an older copy or a .cmd wrapper
 /// (Rust can't pass multi-line arguments through .cmd files).
@@ -40,22 +25,16 @@ fn claude_bin() -> String {
     "claude".into()
 }
 
-/// Runs `claude -p` with the agent's model and streams what it does to the dashboard.
-///
-/// Claude gets none of its built-in tools: only the office's MCP tools, which run inside the
-/// sandbox space. It runs in an empty folder, so there is nothing of yours for it to see.
-pub async fn ask(app: &App, a: Ask<'_>) -> Result<Reply, String> {
-    let model = app.model(a.agent);
+pub async fn ask(app: &App, a: &Ask<'_>, model: &str) -> Result<Reply, String> {
     let turns = a.max_turns.to_string();
     // --setting-sources= : load no settings files, so neither your hooks/plugins nor a cloned
     // repo's .claude/settings.json can run anything. Your login still works.
-    let mut args: Vec<&str> = vec!["-p", "--setting-sources=", "--output-format", "stream-json", "--verbose", "--model", &model, "--max-turns", &turns, "--append-system-prompt", a.system, "--tools", ""];
+    let mut args: Vec<&str> = vec!["-p", "--setting-sources=", "--output-format", "stream-json", "--verbose", "--model", model, "--max-turns", &turns, "--append-system-prompt", a.system, "--tools", ""];
     let mut cfg = None;
-    if let Some(sp) = a.space {
-        let sb = app.sandbox().await;
+    if let Some(t) = &a.tools {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let f = sandbox::tmp_file(&app.data, "json");
-        let server = json!({"type": "stdio", "command": exe.to_string_lossy(), "args": mcp::args(sb, sp, a.readonly)});
+        let server = json!({"type": "stdio", "command": exe.to_string_lossy(), "args": mcp::args(&t.sb, &t.space, t.readonly)});
         std::fs::write(&f, json!({"mcpServers": {"office": server}}).to_string()).map_err(|e| e.to_string())?;
         cfg = Some(f);
     }
@@ -85,7 +64,7 @@ pub async fn ask(app: &App, a: Ask<'_>) -> Result<Reply, String> {
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
     let result = match cmd.spawn() {
-        Ok(child) => run(app, &a, child).await,
+        Ok(child) => run(app, a, child).await,
         Err(e) => Err(format!("cannot start {bin}: {e}")),
     };
     if let Some(f) = cfg {
@@ -124,7 +103,7 @@ async fn run(app: &App, a: &Ask<'_>, mut child: tokio::process::Child) -> Result
                                     app.log(a.agent, a.job, t);
                                 }
                             }
-                            Some("tool_use") => app.tool(a.agent, a.job, &tool_line(c)),
+                            Some("tool_use") => app.tool(a.agent, a.job, &tool_line(c["name"].as_str().unwrap_or("?"), &c["input"])),
                             _ => {}
                         }
                     }
@@ -151,37 +130,4 @@ async fn run(app: &App, a: &Ask<'_>, mut child: tokio::process::Child) -> Result
         return Err(format!("claude error: {}", sh::head(text, 300)));
     }
     Ok(Reply { json: extract_json(text), session: r["session_id"].as_str().unwrap_or("").into() })
-}
-
-/// "sh npm test" instead of "mcp__office__sh {\"cmd\": ...}".
-fn tool_line(c: &Value) -> String {
-    let i = &c["input"];
-    let arg = ["cmd", "path", "pattern"].iter().find_map(|k| i[k].as_str()).map(String::from).unwrap_or_else(|| i.to_string());
-    let name = c["name"].as_str().unwrap_or("?");
-    format!("{} {}", name.strip_prefix("mcp__office__").unwrap_or(name), sh::head(&arg, 160))
-}
-
-/// Models sometimes wrap the JSON in prose or a code fence; take the outermost {...}.
-pub fn extract_json(t: &str) -> Value {
-    let t = t.trim();
-    if let Ok(v) = serde_json::from_str::<Value>(t) {
-        return v;
-    }
-    if let (Some(a), Some(b)) = (t.find('{'), t.rfind('}')) {
-        if a < b {
-            if let Ok(v) = serde_json::from_str::<Value>(&t[a..=b]) {
-                return v;
-            }
-        }
-    }
-    Value::Null
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn json_from_prose() {
-        assert_eq!(super::extract_json("Done.\n```json\n{\"ok\": true}\n```")["ok"], true);
-        assert!(super::extract_json("no json here").is_null());
-    }
 }

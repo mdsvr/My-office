@@ -34,9 +34,11 @@ pub enum Mode {
 pub struct Sandbox {
     pub mode: Mode,
     pub data: PathBuf,
+    /// Docker host of another machine (`ssh://user@host`); None = this PC's Docker.
+    pub host: Option<String>,
 }
 
-/// "work__owner__repo": the space Repro/Fixer/CI/Submit use. Hunter has its own ("hunt__...").
+/// "l1__owner__repo": the space lane 1 uses for a repo. Hunter has its own ("hunt__...").
 pub fn space(kind: &str, repo: &str) -> String {
     format!("{kind}__{}", repo.replace('/', "__"))
 }
@@ -51,17 +53,37 @@ pub fn tmp_file(data: &Path, ext: &str) -> PathBuf {
 }
 
 impl Sandbox {
-    /// Docker if it's running (building the image and starting the container on first use),
-    /// otherwise local. MYOFFICE_SANDBOX=local skips Docker. Returns a note for the dashboard.
+    pub fn local(data: &Path) -> Sandbox {
+        Sandbox { mode: Mode::Local, data: data.into(), host: None }
+    }
+
+    /// This PC: Docker if it's running (building the image and starting the container on first
+    /// use), otherwise local. MYOFFICE_SANDBOX=local skips Docker. Returns a note for the dashboard.
     pub async fn start(data: &Path) -> (Sandbox, String) {
-        let local = Sandbox { mode: Mode::Local, data: data.into() };
         if std::env::var("MYOFFICE_SANDBOX").as_deref() == Ok("local") {
-            return (local, "local (MYOFFICE_SANDBOX=local)".into());
+            return (Sandbox::local(data), "local (MYOFFICE_SANDBOX=local)".into());
         }
-        match docker_up(data).await {
-            Ok(()) => (Sandbox { mode: Mode::Docker, data: data.into() }, "docker".into()),
-            Err(e) => (local, format!("local, Docker not usable: {}", sh::head(&e, 200))),
+        match docker_up(data, None).await {
+            Ok(()) => (Sandbox { mode: Mode::Docker, data: data.into(), host: None }, "docker".into()),
+            Err(e) => (Sandbox::local(data), format!("local, Docker not usable: {}", sh::head(&e, 200))),
         }
+    }
+
+    /// Another machine's Docker over SSH (key login, no password prompt). No local fallback:
+    /// a remote machine that isn't reachable just isn't used.
+    pub async fn remote(data: &Path, host: &str) -> Result<Sandbox, String> {
+        docker_up(data, Some(host)).await?;
+        Ok(Sandbox { mode: Mode::Docker, data: data.into(), host: Some(host.into()) })
+    }
+
+    /// `docker [-H host] <args>`
+    fn docker<'a>(&'a self, args: &[&'a str]) -> Vec<&'a str> {
+        let mut v = vec![];
+        if let Some(h) = &self.host {
+            v.extend(["-H", h.as_str()]);
+        }
+        v.extend_from_slice(args);
+        v
     }
 
     fn local_dir(&self, sp: &str) -> PathBuf {
@@ -74,7 +96,8 @@ impl Sandbox {
             Mode::Docker => {
                 let s = format!("mkdir -p /work/{sp} && cd /work/{sp} && {script}");
                 let t = secs.to_string();
-                sh::run_raw("docker", &["exec", "-i", CONTAINER, "timeout", "-k", "10", &t, "bash", "-c", &s], &self.data, input, secs + 30).await
+                let args = self.docker(&["exec", "-i", CONTAINER, "timeout", "-k", "10", &t, "bash", "-c", &s]);
+                sh::run_raw("docker", &args, &self.data, input, secs + 30).await
             }
             Mode::Local => {
                 let dir = self.local_dir(sp);
@@ -136,34 +159,52 @@ impl Sandbox {
     }
 }
 
-/// Builds the image if needed and makes sure the container is running.
-async fn docker_up(data: &Path) -> Result<(), String> {
+/// Builds the image if needed and makes sure the container is running, on this PC (host None)
+/// or on another machine's Docker (`ssh://user@host`).
+async fn docker_up(data: &Path, host: Option<&str>) -> Result<(), String> {
+    let docker = |args: &[&str]| {
+        let mut v: Vec<String> = host.map(|h| vec!["-H".to_string(), h.to_string()]).unwrap_or_default();
+        v.extend(args.iter().map(|s| s.to_string()));
+        v
+    };
+    let run = |args: Vec<String>, secs: u64| async move {
+        let a: Vec<&str> = args.iter().map(String::as_str).collect();
+        sh::run("docker", &a, data, secs).await
+    };
     let ok = |o: Out, what: &str| if o.code == 0 { Ok(o.out) } else { Err(format!("{what}: {}", sh::tail(&format!("{}{}", o.out, o.err), 300))) };
-    ok(sh::run("docker", &["info", "--format", "{{.ServerVersion}}"], data, 30).await, "docker is not running")?;
-    if sh::run("docker", &["image", "inspect", IMAGE], data, 30).await.code != 0 {
-        eprintln!("  building the sandbox image (first start only, a few minutes)...");
-        let b = sh::run_raw("docker", &["build", "-q", "-t", IMAGE, "-"], data, Some(DOCKERFILE.as_bytes().to_vec()), 3600).await;
+    let info = ok(run(docker(&["info", "--format", "{{.NCPU}} {{.MemTotal}}"]), 60).await, "docker is not reachable")?;
+    let mut it = info.split_whitespace().map(|x| x.parse::<u64>().unwrap_or(0));
+    let (ncpu, mem) = (it.next().unwrap_or(2), it.next().unwrap_or(0));
+    if run(docker(&["image", "inspect", IMAGE]), 60).await.code != 0 {
+        eprintln!("  building the sandbox image{} (first start only, a few minutes)...", host.map(|h| format!(" on {h}")).unwrap_or_default());
+        let a = docker(&["build", "-q", "-t", IMAGE, "-"]);
+        let a: Vec<&str> = a.iter().map(String::as_str).collect();
+        let b = sh::run_raw("docker", &a, data, Some(DOCKERFILE.as_bytes().to_vec()), 3600).await;
         if b.code != 0 {
             return Err(format!("image build failed: {}", sh::tail(&b.err, 400)));
         }
     }
-    let state = sh::run("docker", &["inspect", "-f", "{{.Config.Image}} {{.State.Running}}", CONTAINER], data, 30).await;
+    let state = run(docker(&["inspect", "-f", "{{.Config.Image}} {{.State.Running}}", CONTAINER]), 60).await;
     let s = state.out.trim().to_string();
     if state.code == 0 && !s.starts_with(IMAGE) {
-        let _ = sh::run("docker", &["rm", "-f", CONTAINER], data, 60).await; // old image version
+        let _ = run(docker(&["rm", "-f", CONTAINER]), 60).await; // old image version
     }
     if state.code != 0 || !s.starts_with(IMAGE) {
-        let cpus = std::thread::available_parallelism().map(|n| n.get().saturating_sub(1).max(1)).unwrap_or(1).to_string();
-        // A named volume, not a folder from this PC: the agents can't reach your files.
-        ok(sh::run("docker", &["run", "-d", "--name", CONTAINER, "--restart", "unless-stopped", "--cpus", &cpus, "--memory", "6g", "-v", "myoffice-work:/work", IMAGE, "sleep", "infinity"], data, 120).await, "starting the sandbox")?;
+        let cpus = ncpu.saturating_sub(1).max(1).to_string();
+        // Leave the machine 2 GB, use at most 8 GB.
+        let gb = (mem / (1 << 30)).saturating_sub(2).clamp(2, 8);
+        let memory = format!("{gb}g");
+        // A named volume, not a folder from the machine: the agents can't reach your files.
+        let a = docker(&["run", "-d", "--name", CONTAINER, "--restart", "unless-stopped", "--cpus", &cpus, "--memory", &memory, "-v", "myoffice-work:/work", IMAGE, "sleep", "infinity"]);
+        ok(run(a, 120).await, "starting the sandbox")?;
     } else if s.ends_with("false") {
-        ok(sh::run("docker", &["start", CONTAINER], data, 60).await, "starting the sandbox")?;
+        ok(run(docker(&["start", CONTAINER]), 60).await, "starting the sandbox")?;
     }
     // Commits in the sandbox are made in your name.
     for k in ["user.name", "user.email"] {
         let v = sh::run("git", &["config", "--global", k], data, 10).await.out.trim().to_string();
         let v = if v.is_empty() { if k == "user.name" { "MyOffice".into() } else { "myoffice@localhost".into() } } else { v };
-        ok(sh::run("docker", &["exec", CONTAINER, "git", "config", "--global", k, &v], data, 30).await, "configuring git in the sandbox")?;
+        ok(run(docker(&["exec", CONTAINER, "git", "config", "--global", k, &v]), 60).await, "configuring git in the sandbox")?;
     }
     Ok(())
 }
@@ -191,7 +232,7 @@ mod tests {
         git(&root, &["clone", "-q", "--bare", &src.to_string_lossy(), &mirror.to_string_lossy()]);
         let base = git(&mirror, &["rev-parse", "refs/heads/main"]);
 
-        let sb = Sandbox { mode: Mode::Local, data: root.join("data") };
+        let sb = Sandbox::local(&root.join("data"));
         sb.load("work__t", &mirror, "main").await.unwrap();
         sb.ok("work__t", "git checkout -q -B fix origin/main && echo two >> a.txt && git -c user.name=t -c user.email=t@t commit -qam two", 60).await.unwrap();
         sb.export("work__t", &mirror, "fix", &base).await.unwrap();
