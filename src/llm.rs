@@ -32,6 +32,8 @@ pub struct Ask<'a> {
 pub struct Reply {
     pub json: Value,
     pub session: String,
+    /// The final answer as written, for when the JSON in it can't be read.
+    pub text: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -204,7 +206,7 @@ async fn chat(app: &App, a: &Ask<'_>, p: &Provider, model: &str) -> Result<Reply
     app.db.add_tokens(a.agent, tin + tout, usd);
     SESSIONS.lock().unwrap().get_or_insert_with(HashMap::new).insert(session.clone(), messages);
     let text = result?;
-    Ok(Reply { json: extract_json(&text), session })
+    Ok(Reply { json: extract_json(&text), session, text })
 }
 
 /// Optional USD per million input/output tokens for a provider ("price:<id>" = "3,15").
@@ -226,6 +228,14 @@ pub fn extract_json(t: &str) -> Value {
     if let Ok(v) = serde_json::from_str::<Value>(t) {
         return v;
     }
+    // A fenced ```json block (the last one wins), so braces in prose or code examples elsewhere
+    // don't get in the way.
+    for block in t.split("```json").skip(1).collect::<Vec<_>>().into_iter().rev() {
+        let inner = block.split("```").next().unwrap_or("");
+        if let Ok(v) = serde_json::from_str::<Value>(inner.trim()) {
+            return v;
+        }
+    }
     if let (Some(a), Some(b)) = (t.find('{'), t.rfind('}')) {
         if a < b {
             if let Ok(v) = serde_json::from_str::<Value>(&t[a..=b]) {
@@ -243,6 +253,9 @@ mod tests {
     #[test]
     fn json_from_prose() {
         assert_eq!(extract_json("Done.\n```json\n{\"ok\": true}\n```")["ok"], true);
+        // Braces in a code example before the JSON block must not break it.
+        let t = "Use a cache like `cache = {}` in python.\n```python\nd = {\"a\": 1}\n```\n```json\n{\"verdict\": \"possible\", \"answer\": \"use {} as a dict\"}\n```";
+        assert_eq!(extract_json(t)["verdict"], "possible");
         assert!(extract_json("no json here").is_null());
     }
 

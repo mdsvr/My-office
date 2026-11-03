@@ -144,5 +144,5 @@ async fn run(app: &App, a: &Ask<'_>, mut child: tokio::process::Child) -> Result
     if r["is_error"].as_bool() == Some(true) {
         return Err(format!("claude error: {}", sh::head(text, 300)));
     }
-    Ok(Reply { json: extract_json(text), session: r["session_id"].as_str().unwrap_or("").into() })
+    Ok(Reply { json: extract_json(text), session: r["session_id"].as_str().unwrap_or("").into(), text: text.to_string() })
 }

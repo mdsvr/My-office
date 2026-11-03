@@ -232,7 +232,7 @@ function useOffice() {
 const RUNNING = ['repro', 'fix', 'ci', 'review', 'submit', 'approved'];
 const fmtTime = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const STATE_BADGE = {
-  done: 'bg-emerald-300', vet: 'bg-purple-200', ready: 'bg-sky-200',
+  done: 'bg-emerald-300', vet: 'bg-purple-200', ready: 'bg-sky-200', answered: 'bg-amber-200',
   dropped: 'bg-rose-300', skipped: 'bg-zinc-200', blocked: 'bg-rose-300'
 };
 
@@ -1037,6 +1037,111 @@ const PrTextEditor = ({ job, onSaved }) => {
   );
 };
 
+// --- ASK THE OFFICE: request popup and the answer report ---
+const AskModal = ({ repos, onClose, onSent }) => {
+  const [repo, setRepo] = useState(repos[0]?.full || '');
+  const [text, setText] = useState('');
+  const send = async () => {
+    const r = await api('/api/ask', { repo, text });
+    if (r.ok) onSent(r.id);
+  };
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4" onClick={onClose}>
+      <div className="manga-panel rounded-2xl bg-[#fffdf9] text-[#1a1a1a] max-w-lg w-full p-5 relative" onClick={(e) => e.stopPropagation()}>
+        <button onClick={onClose} className="absolute top-3 right-3 w-7 h-7 rounded-full border-2 border-[#1a1a1a] bg-rose-300 flex items-center justify-center font-black">
+          <X className="w-4 h-4" />
+        </button>
+        <div className="flex items-center gap-2 mb-3">
+          <span className="px-2 py-0.5 bg-[#1a1a1a] text-white font-black text-xs rounded">ASK THE OFFICE</span>
+          <span className="text-xs font-bold text-pink-600">相談</span>
+        </div>
+        <p className="text-xs opacity-80 mb-3">
+          Ask anything about a repository, or a general question. HUNTER investigates (reads the code, may run tests, changes nothing), REVIEWER double-checks, and you get an
+          answer: <b>is it possible</b>, what to <b>do</b> and <b>not do</b>, a plan, the risks and the evidence.
+        </p>
+        <select value={repo} onChange={(e) => setRepo(e.target.value)} className="w-full px-3 py-2 rounded-lg border-2 border-[#1a1a1a] bg-white font-mono text-xs mb-2 focus:outline-none">
+          {repos.map((r) => (
+            <option key={r.full} value={r.full}>{r.full}</option>
+          ))}
+          <option value="">— no repository, general question —</option>
+        </select>
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          rows={5}
+          placeholder={'e.g. Can we add login with Google to this app? What would it take and what should we avoid?\nor: Is it safe to upgrade to Python 3.13?'}
+          className="w-full px-3 py-2 rounded-lg border-2 border-[#1a1a1a] bg-white font-mono text-xs mb-4 focus:outline-none focus:ring-2 focus:ring-pink-400"
+        />
+        <div className="flex justify-end gap-2">
+          <button onClick={onClose} className="manga-btn px-3 py-1.5 rounded-lg bg-zinc-200 text-xs font-black">Cancel</button>
+          <button onClick={send} className="manga-btn px-4 py-1.5 rounded-lg bg-pink-400 text-[#1a1a1a] text-xs font-black flex items-center gap-1">
+            <Send className="w-3.5 h-3.5" /> Ask the office!
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const VERDICT = {
+  possible: 'bg-emerald-300',
+  'possible with caveats': 'bg-amber-200',
+  'not possible': 'bg-rose-300',
+  'need more information': 'bg-sky-200'
+};
+
+const ReportView = ({ report }) => {
+  const r = report || {};
+  const list = (title, items, mark, cls) =>
+    Array.isArray(items) && items.length > 0 && (
+      <div className={`p-2.5 rounded-lg border-2 border-[#1a1a1a] ${cls}`}>
+        <div className="font-black text-[10px] mb-1">{title}</div>
+        <ul className="space-y-0.5">
+          {items.map((x, i) => (
+            <li key={i}>{mark} {String(x)}</li>
+          ))}
+        </ul>
+      </div>
+    );
+  const text = [
+    `Verdict: ${r.verdict}`, r.summary, '', r.answer, '',
+    ...(r.do || []).map((x) => `DO: ${x}`), ...(r.dont || []).map((x) => `DON'T: ${x}`),
+    ...(r.plan || []).map((x, i) => `${i + 1}. ${x}`), ...(r.risks || []).map((x) => `RISK: ${x}`),
+    r.review?.notes ? `Second opinion: ${r.review.notes}` : ''
+  ].filter((x) => x !== undefined).join('\n');
+  return (
+    <div className="space-y-2 text-xs mb-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`px-2 py-1 rounded-lg border-2 border-[#1a1a1a] font-black text-sm uppercase ${VERDICT[r.verdict] || 'bg-zinc-200'}`}>{r.verdict || '?'}</span>
+        {r.effort && <span className="px-2 py-0.5 rounded border border-[#1a1a1a] bg-white font-bold text-[10px]">effort: {r.effort}</span>}
+        {r.review && (
+          <span className={`px-2 py-0.5 rounded border border-[#1a1a1a] font-bold text-[10px] ${r.review.agree === true ? 'bg-emerald-100' : r.review.agree === false ? 'bg-amber-100' : 'bg-zinc-100'}`}>
+            {r.review.agree === true ? '✓ Reviewer agrees' : r.review.agree === false ? `Reviewer corrected it (Hunter said: ${r.hunter_verdict || '?'})` : 'no second opinion'}
+          </span>
+        )}
+        <span className="flex-1" />
+        <button onClick={() => navigator.clipboard?.writeText(text)} className="px-2 py-0.5 rounded border border-[#1a1a1a] bg-white font-bold text-[10px] hover:bg-amber-100">Copy answer</button>
+      </div>
+      {r.summary && <p className="font-bold">{r.summary}</p>}
+      {r.answer && <div className="p-2.5 rounded-lg border-2 border-[#1a1a1a] bg-white whitespace-pre-wrap">{r.answer}</div>}
+      <div className="grid sm:grid-cols-2 gap-2">
+        {list('✅ DO', r.do, '•', 'bg-emerald-50')}
+        {list('⛔ DON\'T', r.dont, '•', 'bg-rose-50')}
+      </div>
+      {list('PLAN', (r.plan || []).map((x, i) => `${i + 1}. ${x}`), '', 'bg-sky-50')}
+      {list('RISKS', r.risks, '⚠', 'bg-amber-50')}
+      {list('OPEN QUESTIONS', r.questions, '?', 'bg-purple-50')}
+      {r.review?.notes && (
+        <div className="p-2.5 rounded-lg border-2 border-[#1a1a1a] bg-pink-50">
+          <div className="font-black text-[10px] mb-1">REVIEWER · SECOND OPINION</div>
+          <div className="whitespace-pre-wrap">{r.review.notes}</div>
+        </div>
+      )}
+      {list('EVIDENCE', r.evidence, '·', 'bg-zinc-50 font-mono text-[10px]')}
+    </div>
+  );
+};
+
 export default function App() {
   const office = useOffice();
   const [logSearch, setLogSearch] = useState('');
@@ -1062,6 +1167,7 @@ export default function App() {
 
   const [showNewBugModal, setShowNewBugModal] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showAsk, setShowAsk] = useState(false);
   const [providers, setProviders] = useState([]);
   const [update, setUpdate] = useState<any>(null);
   useEffect(() => {
@@ -1352,6 +1458,14 @@ export default function App() {
             title="Dispatch your own custom bug into MY OFFICE"
           >
             <Plus className="w-3.5 h-3.5" /> New Issue
+          </button>
+
+          <button
+            onClick={() => setShowAsk(true)}
+            className="manga-btn px-2.5 py-1.5 rounded-md bg-amber-200 text-[#1a1a1a] font-black text-xs flex items-center gap-1"
+            title="Ask the office: is something possible, and what to do or not do"
+          >
+            ❓ Ask
           </button>
 
           {/* Repos Button (From screenshot top-right) */}
@@ -2116,6 +2230,15 @@ export default function App() {
 
               <h3 className="font-black text-base mb-1">{inspectedPr.pr_title || inspectedPr.title}</h3>
               <p className="text-xs opacity-70 mb-3 font-mono">{inspectedPr.why}</p>
+              {inspectedPr.kind === 'ask' && (
+                <>
+                  <div className="mb-2 p-2.5 rounded-lg border-2 border-dashed border-[#1a1a1a] text-xs whitespace-pre-wrap">
+                    <div className="font-black text-[10px] mb-1">YOUR REQUEST</div>
+                    {inspectedPr.data?.body}
+                  </div>
+                  {inspectedPr.data?.report ? <ReportView report={inspectedPr.data.report} /> : <p className="text-xs opacity-60 mb-3">The agents are still working on it…</p>}
+                </>
+              )}
 
               {fix.cause && (
                 <div className="grid sm:grid-cols-2 gap-2 mb-3 text-xs">
@@ -2371,6 +2494,17 @@ export default function App() {
       )}
       {showTuner && <RadioTuner radio={radio} onClose={() => setShowTuner(false)} />}
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+      {showAsk && (
+        <AskModal
+          repos={office.repos}
+          onClose={() => setShowAsk(false)}
+          onSent={(id) => {
+            setShowAsk(false);
+            askNotify();
+            openJob(id);
+          }}
+        />
+      )}
       {!office.auth && (
         <div className="fixed inset-0 z-[60] bg-[#fdfbf7] flex items-center justify-center p-6 text-[#1a1a1a]">
           <div className="manga-panel rounded-2xl bg-white p-6 max-w-md text-sm">

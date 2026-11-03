@@ -1,3 +1,4 @@
+mod ask;
 mod claude;
 mod db;
 mod llm;

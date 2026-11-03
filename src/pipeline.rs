@@ -27,6 +27,8 @@ pub fn label(j: &Job) -> String {
     match (j.issue, j.kind.as_str()) {
         (n, _) if n > 0 => format!("{name}#{n}"),
         (_, "hunt") => format!("{name} (hunt {})", j.id),
+        (_, "ask") if j.repo.is_empty() => format!("question {}", j.id),
+        (_, "ask") => format!("{name} (question {})", j.id),
         _ => format!("{name} (report {})", j.id),
     }
 }
@@ -272,7 +274,9 @@ pub async fn add_issue(app: &App, repo: &str, n: i64) -> Result<(), String> {
 /// Runs one claimed job on a lane: build and verify a fix, or submit an approved one.
 pub async fn run_job(app: &App, lane: &Lane, job: Job) {
     let id = job.id;
-    if matches!(job.kind.as_str(), "review" | "rebase") {
+    if job.kind == "ask" {
+        crate::ask::run(app, lane, &job).await;
+    } else if matches!(job.kind.as_str(), "review" | "rebase") {
         crate::watcher::run(app, lane, &job).await;
     } else if job.state == "approved" {
         if let Err(e) = submit(app, lane, &job).await {

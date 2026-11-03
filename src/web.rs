@@ -30,6 +30,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/job", get(job))
         .route("/api/scan", post(scan))
         .route("/api/issue", post(add_issue))
+        .route("/api/ask", post(ask_office))
         .route("/api/repo", post(save_repo))
         .route("/api/repo/delete", post(delete_repo))
         .route("/api/job/action", post(job_action))
@@ -602,5 +603,18 @@ mod more_tests {
         assert!(super::same("abc", "abc"));
         assert!(!super::same("abc", "abd"));
         assert!(!super::same("", ""), "an empty secret never matches");
+    }
+}
+
+/// "Ask the Office": a request the agents investigate and answer (no code changes).
+async fn ask_office(State(app): S, Json(b): Json<Value>) -> Json<Value> {
+    match crate::ask::add(&app, b["repo"].as_str().unwrap_or("").trim(), b["text"].as_str().unwrap_or("")) {
+        Ok(id) => {
+            if app.paused() {
+                app.log("scout", Some(id), "the office is paused: press Resume office to get your answer");
+            }
+            Json(json!({"ok": true, "id": id}))
+        }
+        Err(e) => err(e),
     }
 }

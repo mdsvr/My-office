@@ -34,6 +34,13 @@ Each agent has its own provider and model (bar under the office: pick an agent, 
 Every provider gets the same office tools in the same sandbox. Small local models are slower and less reliable:
 good for Scout/Guard/Vet, try bigger ones for Repro/Fixer.
 
+## Ask the Office
+
+**❓ Ask** in the header: type a request (about a repo, or a general question). HUNTER investigates in the sandbox
+(reads the code, may run tests, changes nothing), REVIEWER checks the answer against the code, and you get a report:
+**verdict** (possible / possible with caveats / not possible / need more information), the answer, **do** and
+**don't** lists, a plan, effort, risks, evidence (file:line) and open questions. Nothing is changed or pushed.
+
 ## Workers
 
 **Machines** popup: this PC plus other machines with Docker, reached as `ssh://user@host` with your SSH key.
