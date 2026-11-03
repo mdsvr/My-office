@@ -1082,15 +1082,16 @@ export default function App() {
   // Static look (colors, accessories, bios) + live state from the server.
   const agents = INITIAL_AGENTS.map((a) => {
     const l = office.agents[a.id];
-    if (!l) return { ...a, status: 'IDLE', tokens: 0, taskText: '—' };
+    if (!l) return { ...a, status: 'IDLE', tokens: 0, taskText: '—', spec: undefined, speech: '', promptSnippet: '' };
     return {
       ...a,
       status: l.status,
       tokens: l.tokens,
       taskText: l.task || '—',
       model: l.model,
-      speech: l.speech || a.speech,
-      promptSnippet: l.tool || a.promptSnippet
+      spec: l.spec,
+      speech: l.speech || '',
+      promptSnippet: l.tool || ''
     };
   });
   const agentById = (id) => INITIAL_AGENTS.find((a) => a.id === id);
@@ -1153,7 +1154,17 @@ export default function App() {
   const handleChangeAgentModel = (agentId, newModel) => api('/api/agent/model', { agent: agentId, model: newModel });
 
   // "Test Agent": a tiny real request with the agent's model.
-  const handleSoloAgentAction = (agent) => api('/api/agent/test', { agent: agent.id });
+  const [testResult, setTestResult] = useState<any>({});
+  const handleSoloAgentAction = async (agent) => {
+    setTestResult((t) => ({ ...t, [agent.id]: { busy: true, msg: 'testing…' } }));
+    try {
+      const r = await fetch('/api/agent/test', { method: 'POST', headers: H, body: JSON.stringify({ agent: agent.id }) });
+      const j = await r.json();
+      setTestResult((t) => ({ ...t, [agent.id]: { ok: !!j.ok, msg: j.msg || j.error || 'no answer' } }));
+    } catch (e) {
+      setTestResult((t) => ({ ...t, [agent.id]: { ok: false, msg: 'the office did not answer' } }));
+    }
+  };
 
   const handleMergePr = async (prId, e = null) => {
     if (e) e.stopPropagation();
@@ -1808,10 +1819,10 @@ export default function App() {
                 </p>
                 <div className="flex flex-wrap items-center gap-2 pt-0.5">
                   <span className="bg-white text-[#1a1a1a] border border-[#1a1a1a] px-2 py-0.5 rounded text-xs font-bold">
-                    💬 &ldquo;{selectedAgent.speech}&rdquo;
+                    💬 {selectedAgent.speech ? <>&ldquo;{selectedAgent.speech}&rdquo;</> : <span className="opacity-50">nothing said yet</span>}
                   </span>
                   <code className="text-[10px] font-mono bg-zinc-900 text-emerald-300 px-2 py-0.5 rounded border border-[#1a1a1a]">
-                    $ {selectedAgent.promptSnippet}
+                    $ {selectedAgent.promptSnippet || 'no tool calls yet'}
                   </code>
                 </div>
               </div>
@@ -1828,10 +1839,17 @@ export default function App() {
 
               <button
                 onClick={() => handleSoloAgentAction(selectedAgent)}
-                className="manga-btn px-3 py-1.5 rounded-lg bg-amber-200 text-[#1a1a1a] font-black text-xs flex items-center gap-1"
+                disabled={!selectedAgent.spec || testResult[selectedAgent.id]?.busy}
+                title={selectedAgent.spec ? 'Sends one tiny request with this agent\'s model' : 'This agent runs no AI model'}
+                className="manga-btn px-3 py-1.5 rounded-lg bg-amber-200 text-[#1a1a1a] font-black text-xs flex items-center gap-1 disabled:opacity-50"
               >
-                <Play className="w-3.5 h-3.5 fill-current" /> Test Agent
+                <Play className="w-3.5 h-3.5 fill-current" /> {testResult[selectedAgent.id]?.busy ? 'Testing…' : 'Test Agent'}
               </button>
+              {testResult[selectedAgent.id] && !testResult[selectedAgent.id].busy && (
+                <span className={`px-2 py-1 rounded-lg border-2 border-[#1a1a1a] text-[10px] font-mono font-black max-w-[260px] ${testResult[selectedAgent.id].ok ? 'bg-emerald-200' : 'bg-rose-200'}`}>
+                  {testResult[selectedAgent.id].ok ? '✓ ' : '✗ '}{testResult[selectedAgent.id].msg}
+                </span>
+              )}
 
               <button
                 onClick={() => handleGiveMatcha(selectedAgent.id)}

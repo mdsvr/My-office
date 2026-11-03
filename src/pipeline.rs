@@ -729,18 +729,20 @@ pub async fn merge(app: &App, job: &Job) -> Result<(), String> {
 
 // ================================================================ Watcher, Test Agent
 
-pub async fn test_agent(app: &App, agent: &str) {
-    let Some((id, _)) = crate::AGENTS.iter().find(|(a, _)| *a == agent) else { return };
+/// One tiny request with the agent's model. Returns (worked, message), also written to the log.
+pub async fn test_agent(app: &App, agent: &str) -> (bool, String) {
+    let Some((id, _)) = crate::AGENTS.iter().find(|(a, _)| *a == agent) else { return (false, "unknown agent".into()) };
     app.set(id, "WORKING", None, None);
     let t = Instant::now();
     let r = llm::ask(app, Ask { agent: id, job: None, system: "Answer only with JSON.", prompt: r#"Reply with exactly {"ok": true}"#.into(), tools: None, resume: None, max_turns: 1, secs: 120 }).await;
-    let msg = match r {
-        Ok(r) if r.json["ok"] == true => format!("test ok: {} answered in {:.1}s", app.model(id), t.elapsed().as_secs_f32()),
-        Ok(_) => "test: answered, but not with the expected JSON".into(),
-        Err(e) => format!("test failed: {e}"),
+    let (ok, msg) = match r {
+        Ok(r) if r.json["ok"] == true => (true, format!("{} answered in {:.1}s", app.model(id), t.elapsed().as_secs_f32())),
+        Ok(_) => (false, format!("{} answered, but not with the JSON it was asked for (weak model for this agent?)", app.model(id))),
+        Err(e) => (false, sh::head(&e, 300)),
     };
-    app.log(id, None, &msg);
+    app.log(id, None, &format!("test {}: {msg}", if ok { "ok" } else { "failed" }));
     app.set(id, if *id == "hunter" { hunter_status(app) } else { "IDLE" }, None, None);
+    (ok, msg)
 }
 
 #[cfg(test)]

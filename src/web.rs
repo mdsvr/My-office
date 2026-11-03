@@ -325,8 +325,8 @@ async fn test_agent(State(app): S, Json(b): Json<Value>) -> Json<Value> {
     if !AGENTS.iter().any(|(a, m)| *a == agent && !m.is_empty()) {
         return err("this agent runs no model");
     }
-    tokio::spawn(async move { pipeline::test_agent(&app, &agent).await });
-    ok()
+    let (ok, msg) = pipeline::test_agent(&app, &agent).await;
+    Json(json!({"ok": ok, "msg": msg}))
 }
 
 async fn pause(State(app): S, Json(b): Json<Value>) -> Json<Value> {
