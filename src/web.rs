@@ -45,13 +45,19 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/hook/sentry", post(v1_sentry))
         .route("/api/agent/test", post(test_agent))
         .route("/api/office/pause", post(pause))
+        .route("/api/settings", get(get_settings).post(save_settings))
+        .route("/api/notify/test", post(notify_test))
+        .route("/api/update", get(update_check))
+        .route("/api/job/pr-text", post(pr_text))
+        .route("/login", get(login))
         .fallback(get(static_file))
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
 }
 
 /// Only this computer's browser may talk to the office: the Host must be localhost
-/// (stops DNS rebinding) and POSTs need a custom header (stops other websites' forms).
+/// (stops DNS rebinding), POSTs need a custom header (stops other websites' forms), and the
+/// browser needs the session cookie from the one-time login link.
 async fn guard(State(app): S, req: Request, next: Next) -> Response {
     // The report API and webhooks may come from other machines (through a tunnel); they check
     // the API token themselves.
@@ -63,7 +69,42 @@ async fn guard(State(app): S, req: Request, next: Next) -> Response {
     if !host_ok || (req.method() == Method::POST && !req.headers().contains_key("x-myoffice")) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    next.run(req).await
+    if req.uri().path() == "/login" || logged_in(&app, req.headers()) {
+        return next.run(req).await;
+    }
+    if req.uri().path().starts_with("/api/") || req.uri().path() == "/events" {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        "<!doctype html><meta charset=utf-8><title>MY OFFICE</title><body style='font:16px system-ui;padding:40px;background:#fdfbf7'><h2>MY OFFICE</h2><p>Open the one-time login link printed in the terminal where MY OFFICE runs.</p><p>New link: <code>myoffice login-link</code></p>",
+    )
+        .into_response()
+}
+
+fn same(a: &str, b: &str) -> bool {
+    !a.is_empty() && a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn logged_in(app: &App, h: &HeaderMap) -> bool {
+    let session = app.db.get("session").unwrap_or_default();
+    h.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).any(|c| c.trim().strip_prefix("myoffice=").is_some_and(|v| same(v, &session)))
+}
+
+/// The one-time login link: trades its key for a session cookie, then the key is used up.
+async fn login(State(app): S, Query(q): Query<HashMap<String, String>>) -> Response {
+    let key = app.db.get("login_key").unwrap_or_default();
+    if !same(q.get("key").map(String::as_str).unwrap_or(""), &key) {
+        return (StatusCode::FORBIDDEN, "This login link is used up or wrong. Get a new one: myoffice login-link").into_response();
+    }
+    let session = crate::sources::new_token();
+    app.db.set("session", &session);
+    app.db.set("login_key", "");
+    (
+        StatusCode::SEE_OTHER,
+        [(header::SET_COOKIE, format!("myoffice={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000")), (header::LOCATION, "/".to_string())],
+    )
+        .into_response()
 }
 
 async fn static_file(uri: Uri) -> Response {
@@ -439,4 +480,106 @@ async fn api_token(State(app): S, Json(b): Json<Value>) -> Json<Value> {
     app.db.set("api_token", &t);
     app.log("watcher", None, "new API token created (old one stops working)");
     Json(json!({"ok": true, "token": t}))
+}
+
+// ---------------------------------------------------------------- settings, update check, PR text
+
+async fn get_settings(State(app): S) -> Json<Value> {
+    let g = |k: &str| app.db.get(k).unwrap_or_default();
+    Json(json!({
+        "budget_usd": g("budget_usd"), "ntfy_topic": g("ntfy_topic"), "ntfy_server": g("ntfy_server"),
+        "has_api_token": !g("api_token").is_empty(), "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+async fn save_settings(State(app): S, Json(b): Json<Value>) -> Json<Value> {
+    if let Some(v) = b["budget_usd"].as_str() {
+        let v = v.trim();
+        if !v.is_empty() && v.parse::<f64>().map_or(true, |x| x < 0.0) {
+            return err("the budget is a number of USD per day, or empty for none");
+        }
+        app.db.set("budget_usd", v);
+    }
+    for k in ["ntfy_topic", "ntfy_server"] {
+        if let Some(v) = b[k].as_str() {
+            app.db.set(k, v.trim());
+        }
+    }
+    app.log("watcher", None, "settings saved");
+    app.changed();
+    ok()
+}
+
+async fn notify_test(State(app): S) -> Json<Value> {
+    if app.db.get("ntfy_topic").unwrap_or_default().is_empty() {
+        return err("set an ntfy topic first");
+    }
+    app.notify("MY OFFICE", "Test notification: it works.");
+    ok()
+}
+
+/// Compares this version with the newest GitHub release. Never installs anything by itself:
+/// the files aren't signed, so you download and replace the exe yourself.
+async fn update_check(State(app): S) -> Json<Value> {
+    let repo = std::env::var("MYOFFICE_UPDATE_REPO").unwrap_or_else(|_| "mdsvr/My-office".into());
+    let current = env!("CARGO_PKG_VERSION");
+    match crate::sh::ok("gh", &["api", &format!("repos/{repo}/releases/latest"), "-q", "[.tag_name, .html_url] | @tsv"], &app.data, 30).await {
+        Ok(out) => {
+            let mut it = out.trim().split('\t');
+            let (tag, url) = (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string());
+            Json(json!({"current": current, "latest": tag, "newer": newer(&tag, current), "url": url}))
+        }
+        Err(_) => Json(json!({"current": current, "latest": null, "newer": false, "note": "no release published yet"})),
+    }
+}
+
+/// "v0.3.0" vs "0.2.9" → true.
+fn newer(tag: &str, current: &str) -> bool {
+    let v = |s: &str| s.trim_start_matches('v').split('.').map(|x| x.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    v(tag) > v(current)
+}
+
+/// Your edits to the PR title/text (or a follow-up's reply) before approving.
+async fn pr_text(State(app): S, Json(b): Json<Value>) -> Json<Value> {
+    let id = b["id"].as_i64().unwrap_or(0);
+    let Some(j) = app.db.job(id) else { return err("no such job") };
+    if j.state != "approve" {
+        return err("only a fix waiting for your approval can be edited");
+    }
+    if let Some(body) = b["pr_body"].as_str() {
+        // Many projects require it, and hiding it can get you banned.
+        if !body.contains("Generated with AI") {
+            return err("keep the line saying it was generated with AI");
+        }
+    }
+    if b["pr_title"].as_str().is_some_and(|t| t.trim().is_empty()) {
+        return err("the title can't be empty");
+    }
+    app.db.update_data(id, |d| {
+        for k in ["pr_title", "pr_body", "reply"] {
+            if let Some(v) = b[k].as_str() {
+                d[k] = json!(v);
+            }
+        }
+    });
+    app.changed();
+    ok()
+}
+
+#[cfg(test)]
+mod more_tests {
+    #[test]
+    fn versions() {
+        assert!(super::newer("v0.2.0", "0.1.0"));
+        assert!(super::newer("0.1.10", "0.1.9"));
+        assert!(!super::newer("v0.1.0", "0.1.0"));
+        assert!(!super::newer("", "0.1.0"));
+    }
+
+    #[test]
+    fn constant_time_compare() {
+        assert!(super::same("abc", "abc"));
+        assert!(!super::same("abc", "abd"));
+        assert!(!super::same("", ""), "an empty secret never matches");
+    }
 }

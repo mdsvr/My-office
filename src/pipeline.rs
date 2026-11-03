@@ -135,6 +135,11 @@ async fn vet_all(app: &App) -> Result<(), String> {
         }
         app.log("guard", Some(id), &format!("{tag} is safe to work on"));
 
+        if let Some(pr) = open_pr_for(app, &j).await {
+            app.db.set_state(id, "skipped", &format!("already has an open pull request: #{pr}"));
+            app.log("vet", Some(id), &format!("{tag} skipped: PR #{pr} already fixes it"));
+            continue;
+        }
         if j.data["manual"].as_bool() == Some(true) {
             app.db.set_state(id, "ready", "added by you");
             app.wake.notify_one();
@@ -552,6 +557,7 @@ async fn ready(app: &App, sb: &Sandbox, id: i64, repo: &Repo, sp: &str, base: &s
     } else {
         app.db.set_state(id, "approve", "verified, waiting for your approval");
         app.log("submit", Some(id), &format!("{} is ready and verified, waiting for your approval", label(&job)));
+        app.notify("MY OFFICE: fix ready for you", &format!("{}: {}", label(&job), job.data["pr_title"].as_str().unwrap_or(&job.title)));
     }
     Ok(())
 }
@@ -641,6 +647,7 @@ async fn submit(app: &App, lane: &Lane, job: &Job) -> Result<(), String> {
     involve(app, id, "submit");
     app.set("submit", "IDLE", None, Some(&format!("PR opened: {pr}")));
     app.log("submit", Some(id), &format!("PR opened: {pr}"));
+    app.notify("MY OFFICE: PR opened", &format!("{}: {pr}", label(job)));
     Ok(())
 }
 
@@ -687,6 +694,20 @@ pub(crate) async fn my_login(app: &App) -> Result<String, String> {
     Ok(l)
 }
 
+/// An open PR that says it fixes this issue ("fixes #12", "closes #12", ...).
+async fn open_pr_for(app: &App, j: &Job) -> Option<i64> {
+    if j.issue <= 0 || j.kind != "issue" {
+        return None;
+    }
+    let raw = sh::ok("gh", &["pr", "list", "-R", &j.repo, "--state", "open", "--search", &j.issue.to_string(), "--json", "number,title,body", "--limit", "30"], &app.data, 60).await.ok()?;
+    let prs: Vec<Value> = serde_json::from_str(&raw).ok()?;
+    prs.iter().find(|p| fixes_issue(&format!("{} {}", p["title"].as_str().unwrap_or(""), p["body"].as_str().unwrap_or("")), j.issue)).and_then(|p| p["number"].as_i64())
+}
+
+fn fixes_issue(text: &str, n: i64) -> bool {
+    Regex::new(&format!(r"(?i)\b(fix(es|ed)?|close[sd]?|resolve[sd]?)\s*:?\s+#{n}\b")).unwrap().is_match(text)
+}
+
 /// "Someone was faster": the issue got closed while we worked on it.
 pub(crate) async fn issue_closed(app: &App, job: &Job) -> bool {
     job.issue > 0 && sh::ok("gh", &["issue", "view", &job.issue.to_string(), "-R", &job.repo, "--json", "state", "-q", ".state"], &app.data, 60).await.map(|s| s.trim() == "CLOSED").unwrap_or(false)
@@ -728,6 +749,14 @@ mod tests {
 
     fn out(code: i32, s: &str) -> sh::Out {
         sh::Out { code, out: s.into(), err: String::new() }
+    }
+
+    #[test]
+    fn duplicate_pr_detection() {
+        assert!(fixes_issue("Fixes #12: mean is too small", 12));
+        assert!(fixes_issue("This closes #12.", 12));
+        assert!(!fixes_issue("Related to #12", 12), "a mention is not a fix");
+        assert!(!fixes_issue("fixes #123", 12));
     }
 
     #[test]

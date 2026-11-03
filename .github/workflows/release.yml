@@ -1,0 +1,33 @@
+# Push a tag like v0.2.0 to build myoffice.exe and publish it as a GitHub release.
+# MY OFFICE's update check then tells you a newer version exists; you download and replace the
+# exe yourself (the files aren't signed, so nothing installs on its own).
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Dashboard
+        working-directory: web
+        run: npm ci && npm run build
+      - name: Set version from tag
+        shell: bash
+        run: sed -i "s/^version = .*/version = \"${GITHUB_REF_NAME#v}\"/" Cargo.toml
+      - name: Build
+        run: cargo build --release
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp target/release/myoffice.exe myoffice-windows-x64.exe
+          sha256sum myoffice-windows-x64.exe > myoffice-windows-x64.exe.sha256
+          gh release create "$GITHUB_REF_NAME" myoffice-windows-x64.exe myoffice-windows-x64.exe.sha256 --title "MY OFFICE $GITHUB_REF_NAME" --generate-notes

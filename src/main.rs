@@ -157,6 +157,24 @@ impl App {
         self.changed();
     }
 
+    /// Push notification through ntfy (set a topic in Settings). Never blocks the caller.
+    pub fn notify(&self, title: &str, msg: &str) {
+        let Some(topic) = self.db.get("ntfy_topic").filter(|t| !t.trim().is_empty()) else { return };
+        let server = self.db.get("ntfy_server").filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "https://ntfy.sh".into());
+        let url = format!("{}/{}", server.trim_end_matches('/'), topic.trim());
+        let (title, msg) = (title.to_string(), msg.to_string());
+        tokio::spawn(async move {
+            let _ = reqwest::Client::new().post(url).header("Title", title).body(msg).send().await;
+        });
+    }
+
+    /// A new one-time login link for the dashboard (the old one stops working).
+    pub fn login_link(&self) -> String {
+        let k = sources::new_token();
+        self.db.set("login_key", &k);
+        format!("http://127.0.0.1:{}/login?key={k}", self.port)
+    }
+
     /// Tells dashboards to refetch /api/state.
     pub fn changed(&self) {
         let _ = self.tx.send(json!({"type": "changed"}).to_string());
@@ -209,6 +227,12 @@ async fn main() -> anyhow::Result<()> {
             mcp::serve(o).await;
             return Ok(());
         }
+        Some("login-link") => {
+            let data = std::env::var_os("MYOFFICE_DATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("data"));
+            let port: u16 = std::env::var("MYOFFICE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(47400);
+            println!("{}", App::new(data, port)?.login_link());
+            return Ok(());
+        }
         Some("autostart") => {
             println!("{}", autostart(args.get(1).map(String::as_str) == Some("on"))?);
             return Ok(());
@@ -231,9 +255,9 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(workers::supervise(app.clone()));
     tokio::spawn(watcher::watch_loop(app.clone()));
 
-    // ponytail: localhost only, no login. Add a login link before exposing it to a network.
+    // Only this PC can connect, and the dashboard needs the one-time login link below.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    println!("\n  MY OFFICE is running: http://127.0.0.1:{port}\n  data: {}\n  stop with Ctrl+C\n", app.data.display());
+    println!("\n  MY OFFICE is running.\n  Open this one-time login link: {}\n  (new link any time: myoffice login-link)\n  data: {}\n  stop with Ctrl+C\n", app.login_link(), app.data.display());
     axum::serve(listener, web::router(app)).await?;
     Ok(())
 }

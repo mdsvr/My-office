@@ -253,6 +253,7 @@ async fn ready(app: &App, job: &Job, repo: &crate::db::Repo, sb: &crate::sandbox
     } else {
         app.db.set_state(job.id, "approve", "ready, waiting for your approval before pushing to the PR");
         app.log("submit", Some(job.id), &format!("{} is ready, waiting for your approval", job.title));
+        app.notify("MY OFFICE: follow-up ready for you", &job.title);
     }
     Ok(())
 }
