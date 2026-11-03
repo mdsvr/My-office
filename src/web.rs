@@ -86,9 +86,16 @@ fn same(a: &str, b: &str) -> bool {
     !a.is_empty() && a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The last 5 logins stay valid (PC browser, phone, ...); a 6th logs out the oldest.
+const SESSIONS: usize = 5;
+
+fn sessions(app: &App) -> Vec<String> {
+    app.db.get("sessions").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(String::from).collect()
+}
+
 fn logged_in(app: &App, h: &HeaderMap) -> bool {
-    let session = app.db.get("session").unwrap_or_default();
-    h.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).any(|c| c.trim().strip_prefix("myoffice=").is_some_and(|v| same(v, &session)))
+    let all = sessions(app);
+    h.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).any(|c| c.trim().strip_prefix("myoffice=").is_some_and(|v| all.iter().any(|s| same(v, s))))
 }
 
 /// The one-time login link: trades its key for a session cookie, then the key is used up.
@@ -98,7 +105,10 @@ async fn login(State(app): S, Query(q): Query<HashMap<String, String>>) -> Respo
         return (StatusCode::FORBIDDEN, "This login link is used up or wrong. Get a new one: myoffice login-link").into_response();
     }
     let session = crate::sources::new_token();
-    app.db.set("session", &session);
+    let mut all = sessions(&app);
+    all.push(session.clone());
+    let keep = all.len().saturating_sub(SESSIONS);
+    app.db.set("sessions", &all[keep..].join(","));
     app.db.set("login_key", "");
     (
         StatusCode::SEE_OTHER,

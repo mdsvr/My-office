@@ -302,12 +302,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
-    /// Real local model through Ollama: `cargo test ollama -- --ignored` with qwen2.5:3b pulled.
+    /// Real local model through Ollama: `cargo test ollama -- --ignored`.
+    /// Any tool-capable model you have: MYOFFICE_TEST_MODEL (default llama3.2:3b).
     #[tokio::test]
     #[ignore]
     async fn ollama_local_model() {
         let (app, data) = app("ollama");
-        app.db.set("model:fixer", "ollama:qwen2.5:3b");
+        let model = std::env::var("MYOFFICE_TEST_MODEL").unwrap_or_else(|_| "llama3.2:3b".into());
+        app.db.set("model:fixer", &format!("ollama:{model}"));
         let tb = Toolbox { sb: Sandbox::local(&data), space: "work__t".into(), readonly: false };
         let r = ask(&app, Ask { agent: "fixer", job: None, system: "You are a careful assistant. Use the tools when asked.", prompt: "Use the write tool to create the file note.txt containing exactly: local model works. Then reply with only this JSON: {\"done\": true}".into(), tools: Some(tb), resume: None, max_turns: 6, secs: 600 }).await.unwrap();
         let note = std::fs::read_to_string(data.join("sandbox/work__t/note.txt")).unwrap_or_default();
