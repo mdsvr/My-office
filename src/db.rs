@@ -61,7 +61,11 @@ create table if not exists machines(
   lanes integer not null default 1,
   enabled integer not null default 1);
 insert or ignore into machines(id, name, host, lanes) values('me', 'ME', '', 1);
+create table if not exists sessions(token text primary key, used integer not null);
 ";
+
+/// Logged-in browsers kept; past this, the one unused for the longest is logged out.
+const SESSIONS: i64 = 20;
 
 /// Where jobs run: this PC ("me", host "") or another machine's Docker (`ssh://user@host`).
 #[derive(Clone, Serialize)]
@@ -323,6 +327,24 @@ impl Db {
         self.c().query_row("select coalesce(sum(usd), 0) from tokens where day=?1", params![day()], |r| r.get(0)).unwrap_or(0.0)
     }
 
+    /// A new login. Keeps the 20 most recently used, so a browser you use is never pushed out.
+    pub fn add_session(&self, token: &str) {
+        let c = self.c();
+        c.execute("insert into sessions(token, used) values(?1, ?2)", params![token, now()]).unwrap();
+        c.execute("delete from sessions where token not in (select token from sessions order by used desc, rowid desc limit ?1)", params![SESSIONS]).unwrap();
+    }
+
+    /// Is this a logged-in browser? Records the use (at most once a minute).
+    pub fn session_ok(&self, token: &str) -> bool {
+        if token.is_empty() {
+            return false;
+        }
+        let c = self.c();
+        let t = now();
+        let _ = c.execute("update sessions set used=?2 where token=?1 and used < ?2 - 60", params![token, t]);
+        c.query_row("select count(*) from sessions where token=?1", params![token], |r| r.get::<_, i64>(0)).unwrap_or(0) > 0
+    }
+
     pub fn get(&self, k: &str) -> Option<String> {
         self.c().query_row("select v from settings where k=?1", params![k], |r| r.get(0)).optional().unwrap()
     }
@@ -373,6 +395,30 @@ mod recover_tests {
         again.recover();
         assert_eq!(again.job(id).unwrap().state, "ready", "the office's own start restarts it");
         drop(again);
+        let _ = std::fs::remove_file(&f);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    /// A browser in use stays logged in however many new logins come after it.
+    #[test]
+    fn used_browser_is_never_pushed_out() {
+        let f = std::env::temp_dir().join(format!("myoffice-sess-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&f);
+        let db = Db::open(&f).unwrap();
+        db.add_session("mine");
+        db.c().execute("update sessions set used = used + 1000 where token='mine'", []).unwrap(); // recently used
+        for i in 0..30 {
+            db.add_session(&format!("test{i}"));
+        }
+        assert!(db.session_ok("mine"), "the browser you use stays");
+        assert!(!db.session_ok("test0"), "the oldest unused one went");
+        assert!(!db.session_ok(""));
+        assert!(!db.session_ok("nope"));
+        drop(db);
         let _ = std::fs::remove_file(&f);
     }
 }

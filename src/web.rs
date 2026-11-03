@@ -90,15 +90,8 @@ fn same(a: &str, b: &str) -> bool {
 }
 
 /// The last 5 logins stay valid (PC browser, phone, ...); a 6th logs out the oldest.
-const SESSIONS: usize = 5;
-
-fn sessions(app: &App) -> Vec<String> {
-    app.db.get("sessions").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(String::from).collect()
-}
-
 fn logged_in(app: &App, h: &HeaderMap) -> bool {
-    let all = sessions(app);
-    h.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).any(|c| c.trim().strip_prefix("myoffice=").is_some_and(|v| all.iter().any(|s| same(v, s))))
+    h.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).any(|c| c.trim().strip_prefix("myoffice=").is_some_and(|v| app.db.session_ok(v)))
 }
 
 /// The one-time login link: trades its key for a session cookie, then the key is used up.
@@ -117,10 +110,7 @@ async fn login(State(app): S, h: HeaderMap, Query(q): Query<HashMap<String, Stri
             .into_response();
     }
     let session = crate::sources::new_token();
-    let mut all = sessions(&app);
-    all.push(session.clone());
-    let keep = all.len().saturating_sub(SESSIONS);
-    app.db.set("sessions", &all[keep..].join(","));
+    app.db.add_session(&session);
     app.db.set("login_key", "");
     (
         StatusCode::SEE_OTHER,
