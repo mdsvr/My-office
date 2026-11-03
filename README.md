@@ -41,6 +41,11 @@ good for Scout/Guard/Vet, try bigger ones for Repro/Fixer.
 **verdict** (possible / possible with caveats / not possible / need more information), the answer, **do** and
 **don't** lists, a plan, effort, risks, evidence (file:line) and open questions. Nothing is changed or pushed.
 
+At the end of the answer, **NEXT STEP**: add your own points to the plan (optional), then **Proceed** or **Not now**.
+Proceed starts a build: FIXER implements the request + plan + your additions with tests, the full test suite and
+REVIEWER check it (rejections go back to FIXER, up to 3 rounds), and it comes back as **WAITING FOR YOU** with the
+diff and editable PR text. Only your approval opens the pull request.
+
 ## Workers
 
 **Machines** popup: this PC plus other machines with Docker, reached as `ssh://user@host` with your SSH key.
