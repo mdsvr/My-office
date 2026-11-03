@@ -99,10 +99,19 @@ fn logged_in(app: &App, h: &HeaderMap) -> bool {
 }
 
 /// The one-time login link: trades its key for a session cookie, then the key is used up.
-async fn login(State(app): S, Query(q): Query<HashMap<String, String>>) -> Response {
+async fn login(State(app): S, h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
     let key = app.db.get("login_key").unwrap_or_default();
     if !same(q.get("key").map(String::as_str).unwrap_or(""), &key) {
-        return (StatusCode::FORBIDDEN, "This login link is used up or wrong. Get a new one: myoffice login-link").into_response();
+        // An old link in a browser that is already logged in: just open the office.
+        if logged_in(&app, &h) {
+            return (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
+        }
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            "<!doctype html><meta charset=utf-8><title>MY OFFICE</title><body style='font:16px system-ui;padding:40px;background:#fdfbf7'><h2>MY OFFICE</h2><p>This login link was already used (each link works once).</p><p>Get a new one: open a terminal in <code>F:\\MyOffice</code> and run <code>target\\release\\myoffice.exe login-link</code></p>",
+        )
+            .into_response();
     }
     let session = crate::sources::new_token();
     let mut all = sessions(&app);
