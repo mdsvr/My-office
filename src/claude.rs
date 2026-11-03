@@ -12,6 +12,17 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 /// The real claude.exe. `claude` on PATH may be an older copy or a .cmd wrapper
 /// (Rust can't pass multi-line arguments through .cmd files).
+/// Is Claude Code logged in? For the Settings popup: logged_in, method (claude.ai = subscription),
+/// plan. Never the email or org.
+pub async fn login_status(data: &Path) -> Value {
+    let o = sh::run(&claude_bin(), &["auth", "status"], data, 30).await;
+    let v: Value = serde_json::from_str(o.out.trim()).unwrap_or(Value::Null);
+    if v.is_null() {
+        return json!({"logged_in": false, "note": format!("Claude Code didn't answer: {}", sh::head(&format!("{}{}", o.out, o.err), 200))});
+    }
+    json!({"logged_in": v["loggedIn"], "method": v["authMethod"], "plan": v["subscriptionType"]})
+}
+
 fn claude_bin() -> String {
     if let Ok(b) = std::env::var("MYOFFICE_CLAUDE") {
         return b;
@@ -60,7 +71,11 @@ pub async fn ask(app: &App, a: &Ask<'_>, model: &str) -> Result<Reply, String> {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .env_remove("CLAUDECODE")
-        .env_remove("CLAUDE_CODE_ENTRYPOINT");
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        // Always your Claude Code login (subscription), never API billing: an API key in the
+        // environment would take precedence over the login.
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN");
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
     let result = match cmd.spawn() {

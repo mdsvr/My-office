@@ -829,8 +829,10 @@ const ModelPicker = ({ agent, providers }) => {
   return (
     <>
       <select value={prov} onChange={(e) => setProv(e.target.value)} className={sel} title="provider">
-        {(providers.length ? providers : [{ id: 'claude' }]).map((p) => (
-          <option key={p.id} value={p.id}>{p.id}</option>
+        {(providers.length ? providers : [{ id: 'claude', cli: true }]).map((p) => (
+          <option key={p.id} value={p.id}>
+            {p.cli ? 'claude · your Claude Code login (no key)' : p.local ? `${p.id} · local` : `${p.id} · API key`}
+          </option>
         ))}
       </select>
       <span className="opacity-40">/</span>
@@ -866,9 +868,20 @@ const ProviderRow = ({ p, onSaved }) => {
     if (r.ok) { setKey(''); onSaved(); }
   };
   if (p.cli) {
+    const l = p.login || {};
     return (
-      <div className="p-2 rounded-lg border-2 border-[#1a1a1a] bg-white text-[11px]">
-        <b>{p.name}</b> <span className="opacity-60">· uses your Claude Code login, nothing to set</span>
+      <div className={`p-2 rounded-lg border-2 border-[#1a1a1a] text-[11px] ${l.logged_in ? 'bg-emerald-50' : 'bg-rose-50'}`}>
+        <div className="flex items-center justify-between gap-2">
+          <b>{p.name}</b>
+          <span className={`px-1.5 rounded border border-[#1a1a1a] text-[9px] font-black ${l.logged_in ? 'bg-emerald-200' : 'bg-rose-200'}`}>
+            {l.logged_in ? `✓ LOGGED IN · ${l.method === 'claude.ai' ? 'claude.ai' : l.method || '?'}${l.plan ? ' · ' + String(l.plan).toUpperCase() : ''}` : 'NOT LOGGED IN'}
+          </span>
+        </div>
+        <div className="opacity-70 mt-1">
+          {l.logged_in
+            ? 'No API key needed: agents set to "claude" use your Claude Code subscription. This is the default for every agent.'
+            : l.note || 'Open a terminal, run claude, and log in with /login. Then reopen this popup.'}
+        </div>
       </div>
     );
   }
@@ -883,6 +896,7 @@ const ProviderRow = ({ p, onSaved }) => {
           )}
         </span>
       </div>
+      {p.id === 'anthropic' && <div className="opacity-60">Only for API billing. Not needed to use Claude: the "claude" provider above uses your Claude Code login.</div>}
       <div className="flex flex-wrap gap-1.5">
         <input value={base} onChange={(e) => setBase(e.target.value)} placeholder="address" className={`${inputCls} flex-1 min-w-[180px]`} />
         {(p.key_env || p.id === 'custom') && (
@@ -1390,6 +1404,15 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {officePaused && office.auth && (
+        <div className="mx-4 mt-3 manga-card rounded-lg bg-rose-200 text-[#1a1a1a] px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs font-black">
+          <span>⏸ THE OFFICE IS PAUSED · 休憩中 — nothing runs (no scans, no fixes) until you resume.</span>
+          <button onClick={() => api('/api/office/pause', { paused: false })} className="manga-btn px-3 py-1 rounded-md bg-emerald-300 flex items-center gap-1">
+            <Play className="w-3.5 h-3.5 fill-current" /> Resume office
+          </button>
+        </div>
+      )}
 
       {/* ==================== TOP MANGA STRIP: 10 AGENT ROSTER CARDS ==================== */}
       <section className="px-4 pt-3">

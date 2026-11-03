@@ -214,7 +214,7 @@ async fn events(State(app): S) -> Sse<impl Stream<Item = Result<Event, Infallibl
 }
 
 async fn scan(State(app): S) -> Json<Value> {
-    app.log("scout", None, "scan requested from the dashboard");
+    app.log("scout", None, if app.paused() { "scan requested, but the office is paused: press Resume office" } else { "scan requested from the dashboard" });
     app.scan.notify_one();
     ok()
 }
@@ -279,7 +279,7 @@ async fn job_action(State(app): S, Json(b): Json<Value>) -> Json<Value> {
         app.db.update_data(id, |d| d["manual"] = json!(true));
         app.scan.notify_one();
     }
-    app.log("submit", Some(id), &format!("{}: {why}", pipeline::label(&j)));
+    app.log("submit", Some(id), &format!("{}: {why}{}", pipeline::label(&j), if app.paused() { " (the office is paused: press Resume office)" } else { "" }));
     app.wake.notify_one();
     ok()
 }
@@ -331,9 +331,11 @@ async fn pause(State(app): S, Json(b): Json<Value>) -> Json<Value> {
 // ---------------------------------------------------------------- AI providers
 
 async fn providers(State(app): S) -> Json<Value> {
+    let login = crate::claude::login_status(&app.data).await;
     Json(json!(llm::PROVIDERS
         .iter()
         .map(|p| json!({
+            "login": if p.kind == llm::Kind::ClaudeCli { login.clone() } else { Value::Null },
             "id": p.id, "name": p.name, "local": p.local, "cli": p.kind == llm::Kind::ClaudeCli,
             "base": llm::base_url(&app, p), "key_env": p.key_env,
             // Never the key itself: only whether one is there.
