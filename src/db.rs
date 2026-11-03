@@ -136,10 +136,16 @@ impl Db {
         c.execute_batch(SCHEMA)?;
         let _ = c.execute("alter table repos add column hunt integer not null default 0", []); // added after v0.1
         let _ = c.execute("alter table repos add column ci integer not null default 1", []);
-        // Work cut off by a restart starts over; a cut-off submit waits for approval again.
-        c.execute("update jobs set state='ready', why='restarted' where state in ('repro','fix','ci','review')", [])?;
-        c.execute("update jobs set state='approve', why='restarted while submitting, approve again' where state='submit'", [])?;
         Ok(Db(Mutex::new(c)))
+    }
+
+    /// Only when the office itself starts (never from `login-link` and other commands, which may
+    /// run next to a working office): work cut off by a restart starts over; a cut-off submit
+    /// waits for approval again.
+    pub fn recover(&self) {
+        let c = self.c();
+        let _ = c.execute("update jobs set state='ready', why='restarted' where state in ('repro','fix','ci','review')", []);
+        let _ = c.execute("update jobs set state='approve', why='restarted while submitting, approve again' where state='submit'", []);
     }
 
     fn c(&self) -> MutexGuard<'_, Connection> {
@@ -345,6 +351,28 @@ mod tests {
         assert!(db.claim("ME/3").is_none(), "nothing left to take");
         assert_eq!(db.machines()[0].id, "me", "this PC is always there");
         drop(db);
+        let _ = std::fs::remove_file(&f);
+    }
+}
+
+#[cfg(test)]
+mod recover_tests {
+    use super::*;
+
+    /// Opening the database (e.g. `myoffice login-link` next to a running office) must not
+    /// touch jobs that are being worked on; only the office's own start resets them.
+    #[test]
+    fn open_does_not_reset_running_jobs() {
+        let f = std::env::temp_dir().join(format!("myoffice-recover-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&f);
+        let db = Db::open(&f).unwrap();
+        let id = db.add_job("o/r", 1, "issue", "a", "", "fix", "", &json!({}));
+        drop(db);
+        let again = Db::open(&f).unwrap();
+        assert_eq!(again.job(id).unwrap().state, "fix", "a second open leaves it alone");
+        again.recover();
+        assert_eq!(again.job(id).unwrap().state, "ready", "the office's own start restarts it");
+        drop(again);
         let _ = std::fs::remove_file(&f);
     }
 }

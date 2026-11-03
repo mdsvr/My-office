@@ -1090,7 +1090,53 @@ const VERDICT = {
   'need more information': 'bg-sky-200'
 };
 
-const ReportView = ({ report }) => {
+// The end of an answer: add to the plan, then go ahead or not.
+const NextStep = ({ job, verdict, onChanged }) => {
+  const d = job.data || {};
+  const [notes, setNotes] = useState('');
+  const [sure, setSure] = useState(false);
+  if (!job.repo) return <div className="p-2.5 rounded-lg border-2 border-dashed border-[#1a1a1a] text-[11px] opacity-70">General question: there's nothing to build. Ask again with a repository to go ahead with a plan.</div>;
+  if (d.build) {
+    return (
+      <div className="p-2.5 rounded-lg border-2 border-[#1a1a1a] bg-emerald-100 text-xs font-bold">
+        ▶ Going ahead as build job {d.build}{d.notes ? ' (with your additions)' : ''}. Follow it in the QUEUE; it comes back to you for approval before anything is pushed.
+      </div>
+    );
+  }
+  const risky = verdict === 'not possible' || verdict === 'need more information';
+  const proceed = async () => {
+    if (risky && !sure) return setSure(true);
+    const r = await api('/api/ask/proceed', { id: job.id, notes });
+    if (r.ok) onChanged(r.id);
+  };
+  return (
+    <div className="p-3 rounded-xl border-2 border-[#1a1a1a] bg-white space-y-2">
+      <div className="font-black text-[11px]">NEXT STEP · 次のステップ</div>
+      {d.declined && <div className="text-[11px] opacity-70">You chose not to go ahead. You can still change your mind.</div>}
+      <textarea
+        value={notes}
+        onChange={(e) => setNotes(e.target.value)}
+        rows={3}
+        placeholder="➕ Add to the plan (optional): extra steps, things to change, limits… e.g. also add a test for X, don't touch the API"
+        className="w-full px-2 py-1.5 rounded-lg border-2 border-[#1a1a1a] bg-white font-mono text-[11px] focus:outline-none focus:ring-2 focus:ring-pink-400"
+      />
+      {sure && <div className="text-[11px] font-bold text-rose-600">The office said "{verdict}". Click Proceed again if you want it built anyway (add what's missing above).</div>}
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <span className="text-[10px] opacity-60 mr-auto">The agents build it in the sandbox, test and review it, and bring it back for your approval. Nothing is pushed without your OK.</span>
+        {!d.declined && (
+          <button onClick={async () => (await api('/api/ask/decline', { id: job.id })).ok && onChanged()} className="manga-btn px-3 py-1.5 rounded-lg bg-zinc-200 text-xs font-black">
+            Not now
+          </button>
+        )}
+        <button onClick={proceed} className="manga-btn px-4 py-1.5 rounded-lg bg-emerald-300 text-[#1a1a1a] text-xs font-black flex items-center gap-1">
+          <Play className="w-3.5 h-3.5 fill-current" /> {notes.trim() ? 'Proceed with the plan + my additions' : 'Proceed with the plan'}
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const ReportView = ({ report, job = null, onChanged = (_id?) => {} }) => {
   const r = report || {};
   const list = (title, items, mark, cls) =>
     Array.isArray(items) && items.length > 0 && (
@@ -1138,6 +1184,7 @@ const ReportView = ({ report }) => {
         </div>
       )}
       {list('EVIDENCE', r.evidence, '·', 'bg-zinc-50 font-mono text-[10px]')}
+      {job && job.state === 'answered' && <NextStep job={job} verdict={r.verdict} onChanged={onChanged} />}
     </div>
   );
 };
@@ -2236,14 +2283,14 @@ export default function App() {
                     <div className="font-black text-[10px] mb-1">YOUR REQUEST</div>
                     {inspectedPr.data?.body}
                   </div>
-                  {inspectedPr.data?.report ? <ReportView report={inspectedPr.data.report} /> : <p className="text-xs opacity-60 mb-3">The agents are still working on it…</p>}
+                  {inspectedPr.data?.report ? <ReportView report={inspectedPr.data.report} job={inspectedPr} onChanged={(nid) => openJob(inspectedPr.id)} /> : <p className="text-xs opacity-60 mb-3">The agents are still working on it…</p>}
                 </>
               )}
 
               {fix.cause && (
                 <div className="grid sm:grid-cols-2 gap-2 mb-3 text-xs">
-                  <div className="p-2.5 rounded-lg border-2 border-[#1a1a1a] bg-rose-50"><div className="font-black text-[10px] mb-1">CAUSE</div>{fix.cause}</div>
-                  <div className="p-2.5 rounded-lg border-2 border-[#1a1a1a] bg-emerald-50"><div className="font-black text-[10px] mb-1">FIX</div>{fix.fix}</div>
+                  <div className="p-2.5 rounded-lg border-2 border-[#1a1a1a] bg-rose-50"><div className="font-black text-[10px] mb-1">{inspectedPr.kind === 'build' ? 'WHAT WAS BUILT' : 'CAUSE'}</div>{fix.cause}</div>
+                  <div className="p-2.5 rounded-lg border-2 border-[#1a1a1a] bg-emerald-50"><div className="font-black text-[10px] mb-1">{inspectedPr.kind === 'build' ? 'TESTS' : 'FIX'}</div>{fix.fix}</div>
                 </div>
               )}
 

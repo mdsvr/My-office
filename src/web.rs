@@ -31,6 +31,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/scan", post(scan))
         .route("/api/issue", post(add_issue))
         .route("/api/ask", post(ask_office))
+        .route("/api/ask/proceed", post(ask_proceed))
+        .route("/api/ask/decline", post(ask_decline))
         .route("/api/repo", post(save_repo))
         .route("/api/repo/delete", post(delete_repo))
         .route("/api/job/action", post(job_action))
@@ -615,6 +617,21 @@ async fn ask_office(State(app): S, Json(b): Json<Value>) -> Json<Value> {
             }
             Json(json!({"ok": true, "id": id}))
         }
+        Err(e) => err(e),
+    }
+}
+
+/// "Proceed with the plan" (with your additions) on an answered request.
+async fn ask_proceed(State(app): S, Json(b): Json<Value>) -> Json<Value> {
+    match crate::ask::proceed(&app, b["id"].as_i64().unwrap_or(0), b["notes"].as_str().unwrap_or("")) {
+        Ok(id) => Json(json!({"ok": true, "id": id})),
+        Err(e) => err(e),
+    }
+}
+
+async fn ask_decline(State(app): S, Json(b): Json<Value>) -> Json<Value> {
+    match crate::ask::decline(&app, b["id"].as_i64().unwrap_or(0)) {
+        Ok(()) => ok(),
         Err(e) => err(e),
     }
 }

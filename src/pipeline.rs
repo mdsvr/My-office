@@ -29,6 +29,7 @@ pub fn label(j: &Job) -> String {
         (_, "hunt") => format!("{name} (hunt {})", j.id),
         (_, "ask") if j.repo.is_empty() => format!("question {}", j.id),
         (_, "ask") => format!("{name} (question {})", j.id),
+        (_, "build") => format!("{name} (build {})", j.id),
         _ => format!("{name} (report {})", j.id),
     }
 }
@@ -126,7 +127,7 @@ async fn vet_all(app: &App) -> Result<(), String> {
         let issue = untrusted(&j);
 
         app.set("guard", "WORKING", Some(id), Some(&format!("checking {tag}")));
-        let g = llm::ask(app, Ask { agent: "guard", job: Some(id), system: prompts::GUARD, prompt: issue.clone(), tools: None, resume: None, max_turns: 1, secs: 300 }).await?;
+        let g = llm::ask_json(app, Ask { agent: "guard", job: Some(id), system: prompts::GUARD, prompt: issue.clone(), tools: None, resume: None, max_turns: 1, secs: 300 }, "injection").await?;
         app.set("guard", "IDLE", None, Some("—"));
         involve(app, id, "guard");
         if g.json["injection"].as_bool() != Some(false) {
@@ -150,7 +151,7 @@ async fn vet_all(app: &App) -> Result<(), String> {
         app.set("vet", "WORKING", Some(id), Some(&format!("vetting {tag}")));
         let prs = sh::ok("gh", &["pr", "list", "-R", &j.repo, "--state", "open", "--limit", "50", "--json", "number,title"], &app.data, 60).await.unwrap_or_default();
         let prompt = format!("Repository {}.\n\n{issue}\n\nOpen pull requests (number, title):\n{}", j.repo, sh::head(&prs, 6000));
-        let v = llm::ask(app, Ask { agent: "vet", job: Some(id), system: prompts::VET, prompt, tools: None, resume: None, max_turns: 1, secs: 300 }).await?;
+        let v = llm::ask_json(app, Ask { agent: "vet", job: Some(id), system: prompts::VET, prompt, tools: None, resume: None, max_turns: 1, secs: 300 }, "ok").await?;
         app.set("vet", "IDLE", None, Some("—"));
         involve(app, id, "vet");
         let why = v.json["why"].as_str().unwrap_or("no verdict").to_string();
@@ -276,6 +277,8 @@ pub async fn run_job(app: &App, lane: &Lane, job: Job) {
     let id = job.id;
     if job.kind == "ask" {
         crate::ask::run(app, lane, &job).await;
+    } else if job.kind == "build" && job.state != "approved" {
+        crate::ask::build(app, lane, &job).await;
     } else if matches!(job.kind.as_str(), "review" | "rebase") {
         crate::watcher::run(app, lane, &job).await;
     } else if job.state == "approved" {
@@ -294,7 +297,7 @@ pub async fn run_job(app: &App, lane: &Lane, job: Job) {
 }
 
 /// Fresh branch from the latest default branch, in the sandbox. Returns (base, branch, default).
-async fn prepare(app: &App, sb: &Sandbox, job: &Job, sp: &str) -> Result<(String, String, String), String> {
+pub(crate) async fn prepare(app: &App, sb: &Sandbox, job: &Job, sp: &str) -> Result<(String, String, String), String> {
     let default = sync(app, &job.repo, "repro", Some(job.id)).await?;
     sb.load(sp, &mirror(app, &job.repo), &default).await?;
     let branch = if job.issue > 0 { format!("myoffice/issue-{}", job.issue) } else { format!("myoffice/{}-{}", job.kind, job.id) };
@@ -461,13 +464,13 @@ async fn check_fix(app: &App, sb: &Sandbox, job: &Job, repo: &Repo, sp: &str, ba
     });
     app.log("fixer", Some(id), "proof ok: the test fails without the fix and passes with it");
     let explain = format!("Cause: {}\nFix: {}", f["cause"].as_str().unwrap_or(""), f["fix"].as_str().unwrap_or(""));
-    ci_and_review(app, sb, job, repo, sp, base, &untrusted(job), &explain).await
+    ci_and_review(app, sb, job, repo, sp, base, &untrusted(job), &explain, prompts::REVIEWER).await
 }
 
 /// The project's full test suite, then the Reviewer on the diff since `base`.
 /// None = both passed. Some(problem) = feedback for Fixer.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn ci_and_review(app: &App, sb: &Sandbox, job: &Job, repo: &Repo, sp: &str, base: &str, context: &str, explain: &str) -> Result<Option<String>, String> {
+pub(crate) async fn ci_and_review(app: &App, sb: &Sandbox, job: &Job, repo: &Repo, sp: &str, base: &str, context: &str, explain: &str, reviewer: &str) -> Result<Option<String>, String> {
     let id = job.id;
     if !repo.test_cmd.is_empty() {
         app.wait_unpaused().await;
@@ -492,7 +495,7 @@ pub(crate) async fn ci_and_review(app: &App, sb: &Sandbox, job: &Job, repo: &Rep
     app.set("reviewer", "WORKING", Some(id), Some(&format!("reviewing {}", label(job))));
     let diff = sb.ok(sp, &format!("git diff {}", q(&format!("{base}..HEAD"))), 60).await?;
     let prompt = format!("{context}\n\nAuthor's explanation:\n{explain}\n\n<diff>\n{}\n</diff>", sh::head(&diff, 100_000));
-    let r = llm::ask(app, Ask { agent: "reviewer", job: Some(id), system: prompts::REVIEWER, prompt, tools: None, resume: None, max_turns: 1, secs: 900 }).await?;
+    let r = llm::ask_json(app, Ask { agent: "reviewer", job: Some(id), system: reviewer, prompt, tools: Some(Toolbox { sb: sb.clone(), space: sp.to_string(), readonly: true }), resume: None, max_turns: 30, secs: 1200 }, "ok").await?;
     involve(app, id, "reviewer");
     match r.json["ok"].as_bool() {
         Some(true) => {
@@ -617,13 +620,21 @@ async fn submit(app: &App, lane: &Lane, job: &Job) -> Result<(), String> {
             return Err("rebase conflict with the current default branch; reject it or retry the job".into());
         }
         let cmd = job.data["proof"]["test_cmd"].as_str().unwrap_or("").to_string();
-        let tests: Vec<String> = job.data["proof"]["tests"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(String::from)).collect();
-        sb.ok(&sp, "git checkout -q -f HEAD~1", 60).await?;
-        let red = run_here(sb, &sp, &cmd, 1800).await;
-        sb.ok(&sp, &format!("git checkout -q -f {}", q(&branch)), 60).await?;
-        let green = run_here(sb, &sp, &cmd, 1800).await;
-        if let Some(p) = red_problem(&tests, &red).or_else(|| green_problem(&green)) {
-            return Err(format!("after rebasing: {}", sh::head(&p, 300)));
+        if cmd.is_empty() {
+            // A build (no failing-test proof): the project's own test suite has to pass.
+            let suite = app.db.repo(&job.repo).map(|r| r.test_cmd).unwrap_or_default();
+            if !suite.is_empty() && run_here(sb, &sp, &suite, 3600).await.code != 0 {
+                return Err("after rebasing, the project's tests fail".into());
+            }
+        } else {
+            let tests: Vec<String> = job.data["proof"]["tests"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(String::from)).collect();
+            sb.ok(&sp, "git checkout -q -f HEAD~1", 60).await?;
+            let red = run_here(sb, &sp, &cmd, 1800).await;
+            sb.ok(&sp, &format!("git checkout -q -f {}", q(&branch)), 60).await?;
+            let green = run_here(sb, &sp, &cmd, 1800).await;
+            if let Some(p) = red_problem(&tests, &red).or_else(|| green_problem(&green)) {
+                return Err(format!("after rebasing: {}", sh::head(&p, 300)));
+            }
         }
         app.db.update_data(id, |d| d["base"] = json!(tip));
     } else {

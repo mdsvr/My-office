@@ -181,7 +181,7 @@ async fn build(app: &App, lane: &Lane, job: &Job) -> Result<(), String> {
             return Ok(());
         }
         let explain = format!("Rebased onto {onto} and resolved conflicts: {summary}");
-        if let Some(p) = ci_and_review(app, sb, job, &repo, &sp, &tip, &untrusted(&parent), &explain).await? {
+        if let Some(p) = ci_and_review(app, sb, job, &repo, &sp, &tip, &untrusted(&parent), &explain, prompts::REVIEWER).await? {
             return Err(format!("conflict resolution rejected: {}", sh::head(&p, 300)));
         }
         sb.export(&sp, &m, &branch, &tip).await?;
@@ -220,7 +220,7 @@ async fn build(app: &App, lane: &Lane, job: &Job) -> Result<(), String> {
         };
         let problem = match problem {
             Some(p) => Some(p),
-            None => ci_and_review(app, sb, job, &repo, &sp, &before, &format!("{}\n\nMaintainer feedback:\n{}", untrusted(&parent), job.data["body"].as_str().unwrap_or("")), &summary).await?,
+            None => ci_and_review(app, sb, job, &repo, &sp, &before, &format!("{}\n\nMaintainer feedback:\n{}", untrusted(&parent), job.data["body"].as_str().unwrap_or("")), &summary, prompts::REVIEWER).await?,
         };
         match problem {
             None => {

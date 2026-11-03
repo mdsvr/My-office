@@ -246,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
     // Not canonicalize(): on Windows it adds a \\?\ prefix that git and gh don't handle well.
     let data = if data.is_absolute() { data } else { std::env::current_dir()?.join(data) };
     let app = Arc::new(App::new(data, port)?);
+    app.db.recover();
 
     let a = app.clone();
     tokio::spawn(async move {

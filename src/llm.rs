@@ -139,6 +139,22 @@ pub async fn ask(app: &App, a: Ask<'_>) -> Result<Reply, String> {
     }
 }
 
+/// Like `ask`, for answers the office has to read: if the reply has no `key` in readable JSON,
+/// it asks once more in the same conversation for just the JSON (the work isn't redone).
+pub async fn ask_json(app: &App, a: Ask<'_>, key: &str) -> Result<Reply, String> {
+    let (agent, job, system) = (a.agent, a.job, a.system);
+    let r = ask(app, a).await?;
+    if !r.json[key].is_null() || r.session.is_empty() {
+        return Ok(r);
+    }
+    app.log(agent, job, &format!("answer wasn't readable JSON, asking again (it began: {})", sh::head(r.text.trim(), 160)));
+    let again = ask(app, Ask { agent, job, system, prompt: "Your answer couldn't be read by the office. Reply again with ONLY the JSON object it asked for (no prose, no code fence), same content.".into(), tools: None, resume: Some(r.session.clone()), max_turns: 2, secs: 600 }).await;
+    match again {
+        Ok(x) if !x.json[key].is_null() => Ok(x),
+        _ => Ok(r),
+    }
+}
+
 static SESSIONS: Mutex<Option<HashMap<String, Vec<Value>>>> = Mutex::new(None);
 
 /// The OpenAI-compatible tool loop: ask, run the tools it calls in the sandbox, repeat.
