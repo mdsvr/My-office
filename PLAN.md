@@ -137,5 +137,14 @@ During development: `npm run dev` (hot reload) proxies `/api` and `/events` to t
    Claude gets no built-in tools, only the office tools (read, write, edit, grep, ls, sh) running in the sandbox.
    Without Docker the same design runs locally, with a blocklist on the sh tool.
 6. ✅ **Extras**: Hunter, cost per day, browser notifications, `myoffice autostart on|off`, MY OFFICE FM radio.
+7. ✅ **AI providers** (`llm.rs`, `tools.rs`): Claude Code CLI, plus one OpenAI-compatible tool loop for Ollama, LM Studio,
+   custom local servers, OpenAI, Anthropic, Gemini, Groq, OpenRouter. Model per agent is `provider:model`.
+8. ✅ **Workers** (`workers.rs`): machines (this PC + Docker over SSH) × lanes; exclusive job claims; fixes go to the
+   mirror when verified so any lane can submit them.
+9. ✅ **Smart Watcher** (`watcher.rs`): maintainer review comments → follow-up commit + reply (approval first);
+   merge conflicts → rebase; closed issues → drop.
+10. ✅ **Outside bug sources** (`sources.rs`): failed CI polling, `/v1/report` API, Sentry webhook.
+11. ✅ **More extras**: login link, ntfy, daily budget, update check + release workflow, editable PR text,
+    duplicate-PR skip.
 
 Test target: a small repo of your own with planted bugs (like ApolloOffice's `ao-testbed`), so PRs don't go to strangers while testing.

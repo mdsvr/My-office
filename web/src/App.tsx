@@ -208,16 +208,25 @@ const EMPTY: any = { paused: false, machine: {}, counts: { vet: 0, ready: 0, app
 function useOffice() {
   const [s, setS] = useState(EMPTY);
   const [online, setOnline] = useState(false);
+  const [auth, setAuth] = useState(true);
   useEffect(() => {
     let timer = null;
-    const load = () => fetch('/api/state').then((r) => r.json()).then(setS).catch(() => {});
+    const load = () =>
+      fetch('/api/state')
+        .then((r) => {
+          setAuth(r.status !== 401);
+          return r.ok ? r.json() : null;
+        })
+        .then((x) => x && setS(x))
+        .catch(() => {});
+    load();
     const es = new EventSource('/events');
     es.onopen = () => { setOnline(true); load(); };
     es.onerror = () => setOnline(false);
     es.onmessage = () => { clearTimeout(timer); timer = setTimeout(load, 250); };
     return () => { es.close(); clearTimeout(timer); };
   }, []);
-  return { ...s, online };
+  return { ...s, online, auth };
 }
 
 const RUNNING = ['repro', 'fix', 'ci', 'review', 'submit', 'approved'];
@@ -791,6 +800,229 @@ const RadioTuner = ({ radio, onClose }) => {
   );
 };
 
+// --- PICKERS AND POPUPS FOR PROVIDERS, MACHINES, SETTINGS ---
+const inputCls = 'px-2 py-1 rounded-lg border-2 border-[#1a1a1a] bg-white text-[#1a1a1a] font-mono text-[11px] focus:outline-none focus:ring-2 focus:ring-pink-400';
+
+// Provider + model for one agent ("ollama" + "qwen2.5:3b" → "ollama:qwen2.5:3b").
+const ModelPicker = ({ agent, providers }) => {
+  const spec = agent.spec || '';
+  const cut = spec.indexOf(':');
+  const pid = cut > 0 ? spec.slice(0, cut) : 'claude';
+  const cur = cut > 0 ? spec.slice(cut + 1) : spec;
+  const [prov, setProv] = useState(pid);
+  const [models, setModels] = useState([]);
+  const [why, setWhy] = useState('');
+  useEffect(() => setProv(pid), [agent.id, pid]);
+  useEffect(() => {
+    if (!spec) return;
+    setModels([]);
+    setWhy('');
+    fetch(`/api/models?provider=${prov}`)
+      .then((r) => r.json())
+      .then((v) => (Array.isArray(v) ? setModels(v) : setWhy(v.error || 'no model list')))
+      .catch(() => setWhy('unreachable'));
+  }, [prov, spec]);
+  if (!spec) return <span className="text-xs font-mono font-black opacity-60">no model</span>;
+  const choose = (m) => m && api('/api/agent/model', { agent: agent.id, model: `${prov}:${m}` });
+  const list = prov === pid && cur && !models.includes(cur) ? [cur, ...models] : models;
+  const sel = 'text-xs font-mono font-black bg-transparent focus:outline-none cursor-pointer max-w-[150px]';
+  return (
+    <>
+      <select value={prov} onChange={(e) => setProv(e.target.value)} className={sel} title="provider">
+        {(providers.length ? providers : [{ id: 'claude' }]).map((p) => (
+          <option key={p.id} value={p.id}>{p.id}</option>
+        ))}
+      </select>
+      <span className="opacity-40">/</span>
+      {list.length ? (
+        <select value={prov === pid ? cur : ''} onChange={(e) => choose(e.target.value)} className={sel} title="model">
+          <option value="" disabled>pick…</option>
+          {list.map((m) => (
+            <option key={m} value={m}>{m}</option>
+          ))}
+        </select>
+      ) : (
+        <input
+          key={prov}
+          defaultValue={prov === pid ? cur : ''}
+          placeholder={why ? 'type model + Enter' : 'loading…'}
+          title={why}
+          onKeyDown={(e) => e.key === 'Enter' && choose(e.currentTarget.value.trim())}
+          className="text-xs font-mono font-black bg-transparent focus:outline-none w-[130px]"
+        />
+      )}
+    </>
+  );
+};
+
+const ProviderRow = ({ p, onSaved }) => {
+  const [base, setBase] = useState(p.base);
+  const [key, setKey] = useState('');
+  const [price, setPrice] = useState(p.price);
+  const save = async () => {
+    const body: any = { id: p.id, base, price };
+    if (key) body.key = key;
+    const r = await api('/api/provider', body);
+    if (r.ok) { setKey(''); onSaved(); }
+  };
+  if (p.cli) {
+    return (
+      <div className="p-2 rounded-lg border-2 border-[#1a1a1a] bg-white text-[11px]">
+        <b>{p.name}</b> <span className="opacity-60">· uses your Claude Code login, nothing to set</span>
+      </div>
+    );
+  }
+  return (
+    <div className="p-2 rounded-lg border-2 border-[#1a1a1a] bg-white text-[11px] space-y-1.5">
+      <div className="flex items-center justify-between gap-2 font-black">
+        <span>{p.name}</span>
+        <span className="flex gap-1">
+          {p.local && <span className="px-1.5 rounded bg-emerald-200 border border-[#1a1a1a] text-[9px]">LOCAL</span>}
+          {(p.key_env || p.id === 'custom') && (
+            <span className={`px-1.5 rounded border border-[#1a1a1a] text-[9px] ${p.has_key ? 'bg-emerald-200' : 'bg-zinc-200'}`}>{p.has_key ? 'KEY SAVED' : 'NO KEY'}</span>
+          )}
+        </span>
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        <input value={base} onChange={(e) => setBase(e.target.value)} placeholder="address" className={`${inputCls} flex-1 min-w-[180px]`} />
+        {(p.key_env || p.id === 'custom') && (
+          <input type="password" value={key} onChange={(e) => setKey(e.target.value)} placeholder={p.has_key ? '•••• (replace key)' : `API key or env ${p.key_env}`} className={`${inputCls} w-[170px]`} />
+        )}
+        <input value={price} onChange={(e) => setPrice(e.target.value)} placeholder="$ in,out per 1M" title="Optional: USD per million input,output tokens, for the cost counter and budget" className={`${inputCls} w-[110px]`} />
+        <button onClick={save} className="manga-btn px-2 py-0.5 rounded-md bg-sky-200 text-[10px] font-black">Save</button>
+      </div>
+    </div>
+  );
+};
+
+const SettingsModal = ({ onClose }) => {
+  const [providers, setProviders] = useState([]);
+  const [st, setSt] = useState<any>({});
+  const [token, setToken] = useState('');
+  const [upd, setUpd] = useState<any>(null);
+  const load = () => {
+    fetch('/api/providers').then((r) => r.json()).then(setProviders).catch(() => {});
+    fetch('/api/settings').then((r) => r.json()).then(setSt).catch(() => {});
+  };
+  useEffect(() => {
+    load();
+    fetch('/api/update').then((r) => r.json()).then(setUpd).catch(() => {});
+  }, []);
+  const set = (k) => (e) => setSt({ ...st, [k]: e.target.value });
+  const section = (t) => <div className="font-black text-[11px] mt-4 mb-1.5 border-b-2 border-[#1a1a1a] pb-1">{t}</div>;
+  const origin = window.location.origin;
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4" onClick={onClose}>
+      <div className="manga-panel rounded-2xl bg-[#fffdf9] text-[#1a1a1a] max-w-2xl w-full p-5 relative max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <button onClick={onClose} className="absolute top-3 right-3 w-7 h-7 rounded-full border-2 border-[#1a1a1a] bg-rose-300 flex items-center justify-center font-black">
+          <X className="w-4 h-4" />
+        </button>
+        <span className="px-2 py-0.5 bg-[#1a1a1a] text-white font-black text-xs rounded">MY OFFICE SETTINGS · 設定</span>
+
+        {section('AI PROVIDERS')}
+        <p className="text-[10px] opacity-70 mb-2">Pick a provider and model per agent in the bar under the office. Keys go to Windows Credential Manager, never to the sandbox. Local models need tool support (e.g. qwen2.5, llama3.1).</p>
+        <div className="space-y-1.5">
+          {providers.map((p) => (
+            <ProviderRow key={p.id + p.base + p.has_key} p={p} onSaved={load} />
+          ))}
+        </div>
+
+        {section('BUDGET & NOTIFICATIONS')}
+        <div className="flex flex-wrap gap-1.5 items-center text-[11px]">
+          <label className="font-bold">Daily budget $</label>
+          <input value={st.budget_usd || ''} onChange={set('budget_usd')} placeholder="none" className={`${inputCls} w-[70px]`} />
+          <label className="font-bold ml-2">ntfy topic</label>
+          <input value={st.ntfy_topic || ''} onChange={set('ntfy_topic')} placeholder="my-office-xyz" className={`${inputCls} w-[130px]`} />
+          <input value={st.ntfy_server || ''} onChange={set('ntfy_server')} placeholder="https://ntfy.sh" className={`${inputCls} w-[130px]`} />
+          <button onClick={async () => (await api('/api/settings', { budget_usd: st.budget_usd || '', ntfy_topic: st.ntfy_topic || '', ntfy_server: st.ntfy_server || '' })).ok && load()} className="manga-btn px-2 py-0.5 rounded-md bg-sky-200 text-[10px] font-black">Save</button>
+          <button onClick={() => api('/api/notify/test')} className="manga-btn px-2 py-0.5 rounded-md bg-amber-200 text-[10px] font-black">Test</button>
+        </div>
+        <p className="text-[10px] opacity-60 mt-1">The budget pauses AI calls for the rest of the day. ntfy topics are public by name: pick a hard-to-guess one, or your own server.</p>
+
+        {section('BUG REPORTS FROM YOUR TOOLS')}
+        <div className="flex gap-1.5 items-center text-[11px]">
+          <span className="font-bold">API token: {st.has_api_token ? 'active' : 'none'}</span>
+          <button onClick={async () => { const r = await api('/api/token', { op: 'new' }); if (r.token) { setToken(r.token); load(); } }} className="manga-btn px-2 py-0.5 rounded-md bg-sky-200 text-[10px] font-black">New token</button>
+          {st.has_api_token && <button onClick={async () => { await api('/api/token', { op: 'revoke' }); setToken(''); load(); }} className="manga-btn px-2 py-0.5 rounded-md bg-rose-200 text-[10px] font-black">Revoke</button>}
+        </div>
+        {token && (
+          <pre className="mt-2 p-2 rounded-lg border-2 border-[#1a1a1a] bg-[#18181b] text-emerald-300 text-[10px] whitespace-pre-wrap break-all">{`Copy it now, it isn't shown again.
+
+curl -X POST ${origin}/v1/report -H "Authorization: Bearer ${token}" -H "content-type: application/json" -d '{"repo":"owner/repo","title":"...","body":"..."}'
+
+Sentry webhook (through a tunnel): https://YOUR-TUNNEL/v1/hook/sentry?repo=owner/repo&token=${token}`}</pre>
+        )}
+        <p className="text-[10px] opacity-60 mt-1">Failed CI runs need no setup: Scout checks them for repos with "watch CI" on.</p>
+
+        {section('UPDATES')}
+        <div className="text-[11px]">
+          This is version {st.version || '?'}.{' '}
+          {upd == null ? 'checking…' : upd.newer ? <a href={upd.url} target="_blank" rel="noopener noreferrer" className="underline font-black text-pink-600">Version {upd.latest} is available: download it and replace myoffice.exe</a> : upd.latest ? `Up to date (latest ${upd.latest}).` : 'No release published yet.'}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const MachinesPanel = ({ machines }) => {
+  const [host, setHost] = useState('');
+  const [lanes, setLanes] = useState(1);
+  const setM = (m, patch) => api('/api/machine', { id: m.id, name: m.name, host: m.host, lanes: m.lanes, enabled: m.enabled, ...patch });
+  return (
+    <div className="mt-3 space-y-1.5 text-xs">
+      <div className="font-black text-[11px]">WORKERS · lanes run jobs at the same time</div>
+      {(machines || []).map((m) => (
+        <div key={m.id} className="p-2 rounded-lg border-2 border-[#1a1a1a] bg-white flex flex-wrap items-center gap-2">
+          <b>{m.name}</b>
+          <span className="font-mono text-[10px] opacity-70">{m.host || 'this PC'}</span>
+          <span className={`px-1.5 rounded border border-[#1a1a1a] text-[9px] font-black ${m.status === 'ok' ? 'bg-emerald-200' : m.status === 'starting...' ? 'bg-zinc-200' : 'bg-rose-200'}`} title={m.status}>
+            {m.status === 'ok' ? `${m.running} RUNNING` : m.status === 'starting...' ? 'STARTING' : 'NOT REACHABLE'}
+          </span>
+          <span className="flex-1" />
+          <label className="text-[10px] font-bold">lanes</label>
+          <select value={m.lanes} onChange={(e) => setM(m, { lanes: +e.target.value })} className={inputCls}>
+            {[1, 2, 3, 4, 6, 8].map((n) => <option key={n} value={n}>{n}</option>)}
+          </select>
+          {m.id !== 'me' && (
+            <button onClick={() => confirm(`Remove ${m.name}?`) && api('/api/machine/delete', { id: m.id })} className="px-1.5 py-0.5 bg-rose-200 border border-[#1a1a1a] rounded text-[10px] font-black">REMOVE</button>
+          )}
+        </div>
+      ))}
+      <div className="p-2 rounded-lg border-2 border-dashed border-[#1a1a1a] flex flex-wrap items-center gap-1.5">
+        <span className="font-black text-[11px]">+ ADD MACHINE</span>
+        <input value={host} onChange={(e) => setHost(e.target.value)} placeholder="ssh://user@build-box" className={`${inputCls} flex-1 min-w-[160px]`} />
+        <select value={lanes} onChange={(e) => setLanes(+e.target.value)} className={inputCls}>
+          {[1, 2, 3, 4].map((n) => <option key={n} value={n}>{n} lane{n > 1 ? 's' : ''}</option>)}
+        </select>
+        <button onClick={async () => (await api('/api/machine', { host, lanes })).ok && setHost('')} className="manga-btn px-2 py-0.5 rounded-md bg-sky-200 text-[10px] font-black">Add</button>
+      </div>
+      <p className="text-[10px] opacity-60">A remote machine needs Docker and your SSH key (no password prompt). Every lane uses your AI plan at the same time, so more lanes hit rate limits sooner.</p>
+    </div>
+  );
+};
+
+// Edit the PR title/text (or the reply for a follow-up) before approving.
+const PrTextEditor = ({ job, onSaved }) => {
+  const d = job.data || {};
+  const followup = job.kind === 'review' || job.kind === 'rebase';
+  const [title, setTitle] = useState(d.pr_title || job.title || '');
+  const [body, setBody] = useState(followup ? d.reply || '' : d.pr_body || '');
+  const save = async () => {
+    const r = await api('/api/job/pr-text', followup ? { id: job.id, reply: body } : { id: job.id, pr_title: title, pr_body: body });
+    if (r.ok) onSaved();
+  };
+  return (
+    <div className="mb-3 p-2.5 rounded-lg border-2 border-[#1a1a1a] bg-sky-50 text-xs space-y-1.5">
+      <div className="font-black text-[10px]">{followup ? 'REPLY ON THE PR (EDIT BEFORE APPROVING)' : 'PR TEXT (EDIT BEFORE APPROVING)'}</div>
+      {!followup && <input value={title} onChange={(e) => setTitle(e.target.value)} className={`${inputCls} w-full`} />}
+      <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={followup ? 3 : 7} className={`${inputCls} w-full`} />
+      <div className="flex justify-end">
+        <button onClick={save} className="manga-btn px-2 py-0.5 rounded-md bg-sky-200 text-[10px] font-black">Save text</button>
+      </div>
+    </div>
+  );
+};
+
 export default function App() {
   const office = useOffice();
   const [logSearch, setLogSearch] = useState('');
@@ -815,9 +1047,16 @@ export default function App() {
   const [clockStr, setClockStr] = useState('');
 
   const [showNewBugModal, setShowNewBugModal] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [providers, setProviders] = useState([]);
+  const [update, setUpdate] = useState<any>(null);
+  useEffect(() => {
+    fetch('/api/providers').then((r) => r.json()).then((v) => Array.isArray(v) && setProviders(v)).catch(() => {});
+    fetch('/api/update').then((r) => r.json()).then(setUpdate).catch(() => {});
+  }, [showSettings]);
   const [customBugTitle, setCustomBugTitle] = useState('');
   const [newBugRepo, setNewBugRepo] = useState('');
-  const [repoForm, setRepoForm] = useState({ full: '', test_cmd: '', auto: false, hunt: false });
+  const [repoForm, setRepoForm] = useState({ full: '', test_cmd: '', auto: false, hunt: false, ci: true });
 
   useEffect(() => {
     const tick = () => setClockStr(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
@@ -927,7 +1166,7 @@ export default function App() {
 
   const saveRepo = async () => {
     const r = await api('/api/repo', repoForm);
-    if (r.ok) setRepoForm({ full: '', test_cmd: '', auto: false, hunt: false });
+    if (r.ok) setRepoForm({ full: '', test_cmd: '', auto: false, hunt: false, ci: true });
   };
 
   // Theme palette classes
@@ -1105,6 +1344,18 @@ export default function App() {
           >
             <Server className="w-3.5 h-3.5 text-emerald-600" /> Machines
           </button>
+
+          <button
+            onClick={() => setShowSettings(true)}
+            className="manga-btn px-2.5 py-1.5 rounded-md bg-white text-[#1a1a1a] font-black text-xs flex items-center gap-1"
+          >
+            <Sliders className="w-3.5 h-3.5 text-purple-600" /> Settings
+          </button>
+          {update?.newer && (
+            <a href={update.url} target="_blank" rel="noopener noreferrer" className="manga-btn px-2.5 py-1.5 rounded-md bg-amber-300 text-[#1a1a1a] font-black text-xs">
+              ⬆ {update.latest}
+            </a>
+          )}
 
           {/* Ink / Paper Theme Selector */}
           <div className="flex items-center rounded-md border-2 border-[#1a1a1a] bg-white p-0.5 shadow-[2px_2px_0px_#1a1a1a]">
@@ -1549,17 +1800,7 @@ export default function App() {
               <div className="flex items-center gap-1 bg-white text-[#1a1a1a] border-2 border-[#1a1a1a] rounded-lg px-2 py-1 shadow-[2px_2px_0px_#1a1a1a]">
                 <Sliders className="w-3.5 h-3.5 text-purple-600" />
                 <span className="text-[10px] font-black uppercase">Model:</span>
-                <select
-                  value={selectedAgent.model}
-                  disabled={selectedAgent.model === 'no model'}
-                  onChange={(e) => handleChangeAgentModel(selectedAgent.id, e.target.value)}
-                  className="text-xs font-mono font-black bg-transparent focus:outline-none cursor-pointer"
-                >
-                  <option value="Haiku">Haiku</option>
-                  <option value="Sonnet">Sonnet</option>
-                  <option value="Opus">Opus</option>
-                  {selectedAgent.model === 'no model' && <option value="no model">no model</option>}
-                </select>
+                <ModelPicker agent={selectedAgent} providers={providers} />
               </div>
 
               <button
@@ -1880,6 +2121,8 @@ export default function App() {
                 <p className="text-xs opacity-60 mb-4 whitespace-pre-wrap">{d.body ? String(d.body).slice(0, 1500) : 'No diff yet.'}</p>
               )}
 
+              {inspectedPr.state === 'approve' && <PrTextEditor key={inspectedPr.id + inspectedPr.updated} job={inspectedPr} onSaved={() => openJob(inspectedPr.id)} />}
+
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="text-[11px] font-bold">
                   Verified by: <span className="font-mono uppercase">{(inspectedPr.agents || []).join(' → ') || '—'}</span>
@@ -1949,7 +2192,7 @@ export default function App() {
                         </div>
                       </div>
                       <div className="font-mono text-[11px] opacity-75 mt-1">
-                        Test command: {r.test_cmd || 'none'} · Auto-PR: {r.auto ? 'Enabled' : 'asks you first'} · Hunter: {r.hunt ? 'on' : 'off'}
+                        Test command: {r.test_cmd || 'none'} · Auto-PR: {r.auto ? 'Enabled' : 'asks you first'} · Hunter: {r.hunt ? 'on' : 'off'} · CI: {r.ci ? 'watched' : 'off'}
                       </div>
                     </div>
                   ))}
@@ -1975,6 +2218,10 @@ export default function App() {
                   <label className="flex items-center gap-2 text-[11px] font-bold">
                     <input type="checkbox" checked={repoForm.hunt} onChange={(e) => setRepoForm({ ...repoForm, hunt: e.target.checked })} />
                     Let HUNTER read the code and look for unreported bugs (once a day)
+                  </label>
+                  <label className="flex items-center gap-2 text-[11px] font-bold">
+                    <input type="checkbox" checked={repoForm.ci} onChange={(e) => setRepoForm({ ...repoForm, ci: e.target.checked })} />
+                    Watch failed CI runs on the default branch
                   </label>
                   <div className="flex justify-end">
                     <button onClick={saveRepo} className="manga-btn px-3 py-1.5 rounded-lg bg-sky-200 text-xs font-black flex items-center gap-1">
@@ -2005,6 +2252,7 @@ export default function App() {
                     Today: {Object.values(office.agents).reduce((n: number, a: any) => n + (a.tokens || 0), 0) as number}k tokens · ${Number(office.usd_today || 0).toFixed(2)} at API prices (on a Claude subscription you don't pay this per run)
                   </div>
                 </div>
+                <MachinesPanel machines={office.machines} />
               </div>
             )}
           </div>
@@ -2081,6 +2329,16 @@ export default function App() {
         </div>
       )}
       {showTuner && <RadioTuner radio={radio} onClose={() => setShowTuner(false)} />}
+      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+      {!office.auth && (
+        <div className="fixed inset-0 z-[60] bg-[#fdfbf7] flex items-center justify-center p-6 text-[#1a1a1a]">
+          <div className="manga-panel rounded-2xl bg-white p-6 max-w-md text-sm">
+            <div className="font-black text-lg mb-2">MY OFFICE · ログイン</div>
+            <p>Open the one-time login link printed in the terminal where MY OFFICE runs.</p>
+            <p className="mt-2">Need a new one? Run <code className="bg-zinc-100 px-1">myoffice login-link</code></p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
